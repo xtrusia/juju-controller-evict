@@ -26,8 +26,10 @@ Dqlite node that never go away on their own.
 
 ## What this tool does
 
-It runs on a surviving controller and makes the smallest change needed, then
-lets Juju's own workers finish the removal with normal transactions.
+The work happens on a surviving controller. It makes the smallest change
+needed, then lets Juju's own workers finish the removal with normal
+transactions. You normally start it from a Juju client and it reaches the
+controller for you (see Usage).
 
 For MongoDB, it deletes the dead machine's unit documents and pulls the unit
 from the machine's principals. The live cleanup worker then advances the

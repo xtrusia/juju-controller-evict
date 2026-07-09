@@ -71,6 +71,26 @@ controller over `juju scp`, runs there, and cleans up after itself.
 In this mode the JSON backup is copied back to the client as
 `juju-controller-evict-backup-<machine>.json`.
 
+### How the client mode works
+
+The tool uses your local `juju` client. You must be logged in as an admin of
+the controller.
+
+1. It asks `juju status` for the controller machines and picks one that is
+   `started` and is not the machine you are removing.
+2. It copies the running binary to `/tmp` on that machine with `juju scp`.
+3. It runs the copy there with `juju ssh` and `sudo`, and streams the output
+   back to you.
+4. On apply, it copies the JSON backup back to the client.
+5. It removes the binary from the controller when it is done.
+
+Because it copies itself, the binary must be a Linux binary that matches the
+controller architecture (`amd64` or `arm64`). Run it from a Linux client or
+bastion that can reach the controller with `juju`. If your workstation is a
+different OS, copy the matching Linux binary to such a host and run it from
+there. You can also skip the client mode and run the binary on the controller
+directly, as shown next.
+
 You can also run it directly on a surviving controller machine as root. In that
 mode it reads the local `agent.conf` and does not use `juju scp`.
 

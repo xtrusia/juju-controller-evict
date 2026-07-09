@@ -42,9 +42,8 @@ For Dqlite, it connects to the cluster leader and removes the dead node.
 
 ## Preconditions
 
-- The dead controller is never coming back. Do not use this on a machine you
-  can boot again. If you can boot it, just start it and `juju remove-machine`
-  works on its own.
+- The dead controller is never coming back. If you can boot it, just start it
+  and `juju remove-machine` works on its own.
 - You already ran `juju remove-machine <id> -m controller --force`. That
   schedules the cleanup this tool unblocks.
 - The controller still has quorum and answers `juju status`.
@@ -56,8 +55,7 @@ For Dqlite, it connects to the cluster leader and removes the dead node.
 
 ## Usage
 
-From a Juju client, as an admin. The tool copies itself to a surviving
-controller over `juju scp`, runs there, and cleans up after itself.
+From a Juju client, as an admin.
 
     # report only, change nothing
     juju-controller-evict -controller mycontroller
@@ -88,8 +86,7 @@ Because it copies itself, the binary must be a Linux binary that matches the
 controller architecture (`amd64` or `arm64`). Run it from a Linux client or
 bastion that can reach the controller with `juju`. If your workstation is a
 different OS, copy the matching Linux binary to such a host and run it from
-there. You can also skip the client mode and run the binary on the controller
-directly, as shown next.
+there.
 
 You can also run it directly on a surviving controller machine as root. In that
 mode it reads the local `agent.conf` and does not use `juju scp`.

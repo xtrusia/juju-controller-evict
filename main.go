@@ -67,7 +67,6 @@ const (
 	deadInterval = 2 * time.Second
 
 	// Juju machine lifecycle values stored in the "life" field.
-	lifeAlive = 0
 	lifeDying = 1
 	lifeDead  = 2
 
@@ -85,7 +84,6 @@ var unitDocCollections = []string{"statuses", "unitstates", "constraints"}
 type agentConf struct {
 	ControllerCert string `yaml:"controllercert"`
 	ControllerKey  string `yaml:"controllerkey"`
-	CACert         string `yaml:"cacert"`
 	StatePassword  string `yaml:"statepassword"`
 	DqlitePort     int    `yaml:"dqlite-port"`
 	StatePort      int    `yaml:"stateport"`

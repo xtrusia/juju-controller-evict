@@ -47,6 +47,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 const (
 	defaultDqlitePort = 17666
 	defaultStatePort  = 37017
@@ -133,7 +136,13 @@ func main() {
 	skipMongo := flag.Bool("skip-mongo", false, "leave the Juju state documents alone")
 	skipDqlite := flag.Bool("skip-dqlite", false, "leave the Dqlite cluster alone")
 	timeout := flag.Duration("timeout", 2*time.Minute, "overall timeout")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	// When not run on a controller machine, act as a driver: copy this binary
 	// to a surviving controller over "juju scp", run it there, fetch the backup

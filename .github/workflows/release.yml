@@ -7,6 +7,7 @@ on:
       - '**.go'
       - go.mod
       - go.sum
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -55,13 +56,12 @@ jobs:
           done
           ( cd dist && sha256sum * > SHA256SUMS )
 
-      - name: Tag and release
+      - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.next }}
         run: |
-          git tag "$VERSION"
-          git push origin "$VERSION"
           gh release create "$VERSION" dist/* \
             --title "$VERSION" \
+            --target "$GITHUB_SHA" \
             --generate-notes

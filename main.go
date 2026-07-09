@@ -10,10 +10,13 @@
 //
 // This tool unblocks both, on a surviving controller machine:
 //
-//   - Mongo: deletes the dead machine's unit documents (and their statuses,
-//     unit state and constraints) and decrements the application unit count, so
-//     the evacuateMachine cleanup sees no units left and lets Juju retire the
-//     machine on its own.
+//   - Mongo: deletes the dead machine's unit documents and their statuses, unit
+//     state and constraints, decrements the application unit count, and pulls
+//     the units from the machine's principals. Juju's cleanup then advances the
+//     machine to Dying, which also removes the controller reference and the dead
+//     replica set member. The tool sets the machine Dead so the live provisioner
+//     removes it and all of its related documents with normal transactions. It
+//     does not rebuild the machine removal by hand.
 //   - Dqlite: removes the dead node from the Raft cluster.
 //
 // It is a support tool for a machine that is never coming back. It refuses to

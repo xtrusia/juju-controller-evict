@@ -48,6 +48,9 @@ For Dqlite, it connects to the cluster leader and removes the dead node.
 - The controller still has quorum and answers `juju status`.
 - The dead member reports `DOWN` in the MongoDB replica set. The tool checks
   this three times before it acts.
+- The dead member no longer has a vote. After you force-remove the machine, the
+  peer grouper demotes it to a non-voting member. The tool refuses while the
+  member still has a vote, so you may need to wait a short time.
 
 ## Usage
 
@@ -62,6 +65,9 @@ controller over `juju scp`, runs there, and cleans up after itself.
 
     # apply
     juju-controller-evict -controller mycontroller -machine 1 -yes
+
+In this mode the JSON backup is copied back to the client as
+`juju-controller-evict-backup-<machine>.json`.
 
 You can also run it directly on a surviving controller machine as root. In that
 mode it reads the local `agent.conf` and does not use `juju scp`.
@@ -81,6 +87,13 @@ After it finishes, watch `juju status` until the machine disappears, then run
   only tool.
 - `-skip-dqlite` leave the Dqlite cluster alone.
 - `-backup` path for the JSON backup of every document it deletes or changes.
+- `-agent-conf` path to a controller `agent.conf`. Passing it forces the
+  on-controller worker mode.
+- `-cluster` path to the Dqlite `cluster.yaml`. Default is
+  `/var/lib/juju/dqlite/cluster.yaml`.
+- `-mongo-ca`, `-mongo-cert` paths to the CA and client certificate mongod was
+  started with. Defaults point at the `juju-db` snap.
+- `-timeout` overall timeout.
 
 ## Safety
 

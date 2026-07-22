@@ -31,10 +31,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -111,9 +113,21 @@ type plan struct {
 	DqliteNodeID  uint64                 `json:"dqlite_node_id"`
 	Units         []string               `json:"units"`
 	Delete        []deletion             `json:"delete"`
-	AppDecrements map[string]int         `json:"application_unitcount_decrement"`
+	Applications  []applicationChange    `json:"applications"`
 	MachineDocID  string                 `json:"machine_doc_id"`
 	MachineDoc    map[string]interface{} `json:"machine_doc_before"`
+}
+
+type applicationChange struct {
+	Name            string                 `json:"name"`
+	ID              string                 `json:"_id"`
+	UnitCountBefore int                    `json:"unitcount_before"`
+	Decrement       int                    `json:"unitcount_decrement"`
+	Doc             map[string]interface{} `json:"doc_before"`
+}
+
+func (c applicationChange) UnitCountAfter() int {
+	return c.UnitCountBefore - c.Decrement
 }
 
 type deletion struct {
@@ -429,7 +443,6 @@ func run(a runArgs) error {
 		Machine:       a.machine,
 		MemberAddress: target.Address,
 		DqliteAddress: dqliteAddr,
-		AppDecrements: map[string]int{},
 	}
 	if dqliteNode != nil {
 		p.DqliteNodeID = dqliteNode.ID
@@ -441,7 +454,7 @@ func run(a runArgs) error {
 	}
 
 	fmt.Printf("\nplan for dead controller machine %s (%s):\n", a.machine, host)
-	printPlan(&p)
+	printPlan(os.Stdout, &p)
 
 	if !a.apply {
 		fmt.Println("\ndry run: nothing was changed. Re-run with -yes to apply.")
@@ -451,10 +464,14 @@ func run(a runArgs) error {
 		if err := writeBackup(a.backup, &p); err != nil {
 			return err
 		}
-		fmt.Printf("\nbackup of %d documents written to %s\n", len(p.Delete), a.backup)
+		backupDocuments := len(p.Delete) + len(p.Applications) + 1
+		fmt.Printf("\nbackup of %d documents written to %s\n", backupDocuments, a.backup)
 	}
 
 	if !a.skipMongo {
+		if err := revalidateMongoPlan(session, &p); err != nil {
+			return err
+		}
 		if err := applyMongo(session, &p); err != nil {
 			return err
 		}
@@ -646,6 +663,7 @@ func confirmDead(session *mgo.Session, machine string) error {
 
 func planMongo(session *mgo.Session, machine string, p *plan) error {
 	db := session.DB(stateDB)
+	appDecrements := map[string]int{}
 
 	var units []map[string]interface{}
 	if err := db.C("units").Find(bson.M{"machineid": machine}).All(&units); err != nil {
@@ -656,17 +674,33 @@ func planMongo(session *mgo.Session, machine string, p *plan) error {
 	}
 
 	for _, u := range units {
-		id, _ := u["_id"].(string)
-		name, _ := u["name"].(string)
+		id, ok := u["_id"].(string)
+		if !ok || id == "" {
+			return fmt.Errorf("unit document on machine %s has no string _id", machine)
+		}
+		name, ok := u["name"].(string)
+		if !ok || name == "" {
+			return fmt.Errorf("units/%s has no string name", id)
+		}
+		parts := strings.SplitN(name, "/", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			return fmt.Errorf("units/%s has invalid unit name %q", id, name)
+		}
 		if err := assertNoPendingTxn(u, "units", id); err != nil {
 			return err
 		}
+		modelUUID, ok := u["model-uuid"].(string)
+		if !ok || modelUUID == "" {
+			return fmt.Errorf("units/%s has no string model-uuid", id)
+		}
 		if p.ModelUUID == "" {
-			p.ModelUUID, _ = u["model-uuid"].(string)
+			p.ModelUUID = modelUUID
+		} else if p.ModelUUID != modelUUID {
+			return fmt.Errorf("units on machine %s belong to different models", machine)
 		}
 		p.Units = append(p.Units, name)
 		p.Delete = append(p.Delete, deletion{Collection: "units", ID: id, Doc: u})
-		p.AppDecrements[strings.SplitN(name, "/", 2)[0]]++
+		appDecrements[parts[0]]++
 
 		re := unitDocRegexp(name)
 		for _, coll := range unitDocCollections {
@@ -675,13 +709,41 @@ func planMongo(session *mgo.Session, machine string, p *plan) error {
 				return fmt.Errorf("finding %s documents for %s: %w", coll, name, err)
 			}
 			for _, d := range docs {
-				did, _ := d["_id"].(string)
+				did, ok := d["_id"].(string)
+				if !ok || did == "" {
+					return fmt.Errorf("%s document for %s has no string _id", coll, name)
+				}
 				if err := assertNoPendingTxn(d, coll, did); err != nil {
 					return err
 				}
 				p.Delete = append(p.Delete, deletion{Collection: coll, ID: did, Doc: d})
 			}
 		}
+	}
+	sort.Strings(p.Units)
+	sort.Slice(p.Delete, func(i, j int) bool {
+		if p.Delete[i].Collection == p.Delete[j].Collection {
+			return p.Delete[i].ID < p.Delete[j].ID
+		}
+		return p.Delete[i].Collection < p.Delete[j].Collection
+	})
+
+	appNames := make([]string, 0, len(appDecrements))
+	for name := range appDecrements {
+		appNames = append(appNames, name)
+	}
+	sort.Strings(appNames)
+	for _, name := range appNames {
+		id := p.ModelUUID + ":" + name
+		var doc map[string]interface{}
+		if err := db.C("applications").FindId(id).One(&doc); err != nil {
+			return fmt.Errorf("reading application %s doc: %w", name, err)
+		}
+		change, err := applicationChangeFor(name, id, appDecrements[name], doc)
+		if err != nil {
+			return err
+		}
+		p.Applications = append(p.Applications, change)
 	}
 
 	// Snapshot the machine doc: we pull the units from its principals and later
@@ -694,8 +756,82 @@ func planMongo(session *mgo.Session, machine string, p *plan) error {
 	if err := assertNoPendingTxn(mdoc, "machines", p.MachineDocID); err != nil {
 		return err
 	}
+	if err := validateMachinePrincipals(mdoc, p.Units); err != nil {
+		return fmt.Errorf("machines/%s: %w", p.MachineDocID, err)
+	}
 	p.MachineDoc = mdoc
 	return nil
+}
+
+func applicationChangeFor(name, id string, decrement int, doc map[string]interface{}) (applicationChange, error) {
+	if err := assertNoPendingTxn(doc, "applications", id); err != nil {
+		return applicationChange{}, err
+	}
+	unitCount, ok := doc["unitcount"].(int)
+	if !ok {
+		return applicationChange{}, fmt.Errorf("applications/%s unitcount is missing or not an integer", id)
+	}
+	if unitCount < decrement {
+		return applicationChange{}, fmt.Errorf("applications/%s unitcount is %d; cannot decrement by %d", id, unitCount, decrement)
+	}
+	return applicationChange{
+		Name:            name,
+		ID:              id,
+		UnitCountBefore: unitCount,
+		Decrement:       decrement,
+		Doc:             doc,
+	}, nil
+}
+
+func validateMachinePrincipals(doc map[string]interface{}, units []string) error {
+	raw, ok := doc["principals"]
+	if !ok {
+		return fmt.Errorf("principals is missing")
+	}
+	principals := map[string]bool{}
+	switch values := raw.(type) {
+	case []interface{}:
+		for _, value := range values {
+			principal, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("principals contains a non-string value")
+			}
+			principals[principal] = true
+		}
+	case []string:
+		for _, principal := range values {
+			principals[principal] = true
+		}
+	default:
+		return fmt.Errorf("principals is not an array")
+	}
+	for _, unit := range units {
+		if !principals[unit] {
+			return fmt.Errorf("unit %s is not present in principals", unit)
+		}
+	}
+	return nil
+}
+
+func revalidateMongoPlan(session *mgo.Session, planned *plan) error {
+	fresh := plan{Machine: planned.Machine}
+	if err := planMongo(session, planned.Machine, &fresh); err != nil {
+		return fmt.Errorf("revalidating Mongo plan before write: %w", err)
+	}
+	if !sameMongoPlan(planned, &fresh) {
+		return fmt.Errorf("Mongo state changed after planning; no changes were applied, retry the command")
+	}
+	return nil
+}
+
+func sameMongoPlan(a, b *plan) bool {
+	return a.Machine == b.Machine &&
+		a.ModelUUID == b.ModelUUID &&
+		a.MachineDocID == b.MachineDocID &&
+		reflect.DeepEqual(a.Units, b.Units) &&
+		reflect.DeepEqual(a.Delete, b.Delete) &&
+		reflect.DeepEqual(a.Applications, b.Applications) &&
+		reflect.DeepEqual(a.MachineDoc, b.MachineDoc)
 }
 
 // unitDocRegexp matches an _id that contains the unit name as a whole segment,
@@ -724,13 +860,12 @@ func applyMongo(session *mgo.Session, p *plan) error {
 			return fmt.Errorf("deleting %s/%s: %w", d.Collection, d.ID, err)
 		}
 	}
-	for app, n := range p.AppDecrements {
-		id := p.ModelUUID + ":" + app
-		err := db.C("applications").UpdateId(id, bson.M{
-			"$inc": bson.M{"unitcount": -n, "txn-revno": 1},
+	for _, app := range p.Applications {
+		err := db.C("applications").UpdateId(app.ID, bson.M{
+			"$inc": bson.M{"unitcount": -app.Decrement, "txn-revno": 1},
 		})
 		if err != nil {
-			return fmt.Errorf("decrementing unitcount of %s: %w", id, err)
+			return fmt.Errorf("decrementing unitcount of %s: %w", app.ID, err)
 		}
 	}
 	// Pull the removed units from the machine's principals. Without this the
@@ -892,14 +1027,17 @@ func printNodes(nodes []dqlite.NodeInfo, leader *dqlite.NodeInfo) {
 	w.Flush()
 }
 
-func printPlan(p *plan) {
+func printPlan(w io.Writer, p *plan) {
+	for _, d := range p.Delete {
+		fmt.Fprintf(w, "  mongo: delete %s/%s\n", d.Collection, d.ID)
+	}
+	for _, app := range p.Applications {
+		fmt.Fprintf(w, "  mongo: update applications/%s unitcount %d -> %d\n", app.ID, app.UnitCountBefore, app.UnitCountAfter())
+	}
 	if len(p.Units) > 0 {
-		fmt.Printf("  mongo: remove units %s and %d related documents\n", strings.Join(p.Units, ", "), len(p.Delete)-len(p.Units))
-		for app, n := range p.AppDecrements {
-			fmt.Printf("  mongo: decrement %s unitcount by %d\n", app, n)
-		}
+		fmt.Fprintf(w, "  mongo: update machines/%s remove principals %s\n", p.MachineDocID, strings.Join(p.Units, ", "))
 	}
 	if p.DqliteNodeID != 0 {
-		fmt.Printf("  dqlite: remove node %d (%s)\n", p.DqliteNodeID, p.DqliteAddress)
+		fmt.Fprintf(w, "  dqlite: remove node %d (%s)\n", p.DqliteNodeID, p.DqliteAddress)
 	}
 }

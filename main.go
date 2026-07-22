@@ -10,13 +10,15 @@
 //
 // This tool unblocks both, on a surviving controller machine:
 //
-//   - Mongo: deletes the dead machine's unit documents and their statuses, unit
-//     state and constraints, decrements the application unit count, and pulls
-//     the units from the machine's principals. Juju's cleanup then advances the
-//     machine to Dying, which also removes the controller reference and the dead
-//     replica set member. The tool sets the machine Dead so the live provisioner
-//     removes it and all of its related documents with normal transactions. It
-//     does not rebuild the machine removal by hand.
+//   - Mongo: removes the dead replica set member if its vote blocks Juju's
+//     reconfig, falling back to a forced reconfig only after a quorum-check
+//     failure. It then deletes the dead machine's unit documents and their
+//     statuses, unit state and constraints, decrements the application unit
+//     count, and pulls the units from the machine's principals. Juju's cleanup
+//     advances the machine to Dying and removes the controller reference. The
+//     tool sets the machine Dead so the live provisioner removes it and all of
+//     its related documents with normal transactions. It does not rebuild the
+//     machine removal by hand.
 //   - Dqlite: removes the dead node from the Raft cluster.
 //
 // It is a support tool for a machine that is never coming back. It refuses to
@@ -29,6 +31,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -46,6 +49,8 @@ import (
 	dqlite "github.com/canonical/go-dqlite/v3/client"
 	"github.com/juju/mgo/v3"
 	"github.com/juju/mgo/v3/bson"
+	"github.com/juju/mgo/v3/sstxn"
+	"github.com/juju/mgo/v3/txn"
 	"gopkg.in/yaml.v3"
 )
 
@@ -57,23 +62,33 @@ const (
 	defaultStatePort  = 37017
 	mongoServerName   = "juju-mongodb"
 	stateDB           = "juju"
+	controllersC      = "controllers"
+	modelGlobalKey    = "e"
 
-	// downState is the MongoDB replica set member state for a member the
-	// primary cannot reach. Confirmed against replSetGetStatus, which reports
-	// state 8 with stateStr "(not reachable/healthy)".
-	downState = 8
+	// MongoDB replica set member states returned by replSetGetStatus.
+	primaryState   = 1
+	secondaryState = 2
+	unknownState   = 6
+	arbiterState   = 7
+	downState      = 8
 
 	// deadSamples is how many times the dead member's state is re-checked
 	// before anything is deleted, so a transient blip cannot look like death.
 	deadSamples  = 3
 	deadInterval = 2 * time.Second
 
+	// MongoDB elections commonly finish within 12 seconds. Poll past that
+	// window before reporting a partial reconfiguration.
+	primaryPollAttempts = 16
+	primaryPollInterval = time.Second
+
 	// Juju machine lifecycle values stored in the "life" field.
 	lifeDying = 1
 	lifeDead  = 2
 
 	// After deleting the units the evacuate cleanup advances the machine to
-	// Dying on its own timer; wait up to this long for it before setting Dead.
+	// Dying and removes its controller reference on its own timer. Wait for
+	// both changes before setting the machine Dead.
 	dyingWait     = 3 * time.Minute
 	dyingPollTick = 5 * time.Second
 )
@@ -87,6 +102,8 @@ type agentConf struct {
 	ControllerCert string `yaml:"controllercert"`
 	ControllerKey  string `yaml:"controllerkey"`
 	StatePassword  string `yaml:"statepassword"`
+	ModelTag       string `yaml:"model"`
+	ModelUUID      string `yaml:"-"`
 	DqlitePort     int    `yaml:"dqlite-port"`
 	StatePort      int    `yaml:"stateport"`
 }
@@ -106,16 +123,64 @@ func (c *agentConf) statePort() int {
 }
 
 type plan struct {
-	Machine       string                 `json:"machine"`
-	ModelUUID     string                 `json:"model_uuid"`
-	MemberAddress string                 `json:"mongo_member_address"`
-	DqliteAddress string                 `json:"dqlite_address"`
-	DqliteNodeID  uint64                 `json:"dqlite_node_id"`
-	Units         []string               `json:"units"`
-	Delete        []deletion             `json:"delete"`
-	Applications  []applicationChange    `json:"applications"`
-	MachineDocID  string                 `json:"machine_doc_id"`
-	MachineDoc    map[string]interface{} `json:"machine_doc_before"`
+	Machine            string                 `json:"machine"`
+	ModelUUID          string                 `json:"model_uuid"`
+	MemberAddress      string                 `json:"mongo_member_address"`
+	ReplicaSetEviction *replicaSetEviction    `json:"replica_set_eviction,omitempty"`
+	DqliteAddress      string                 `json:"dqlite_address"`
+	DqliteNodeID       uint64                 `json:"dqlite_node_id"`
+	Units              []string               `json:"units"`
+	Delete             []deletion             `json:"delete"`
+	Applications       []applicationChange    `json:"applications"`
+	MachineDocID       string                 `json:"machine_doc_id"`
+	MachineDoc         map[string]interface{} `json:"machine_doc_before"`
+}
+
+type replicaSetEviction struct {
+	MemberID      int              `json:"member_id"`
+	MemberAddress string           `json:"member_address"`
+	NoPrimary     bool             `json:"no_primary"`
+	Config        replicaSetConfig `json:"config_before"`
+}
+
+type replicaSetConfig struct {
+	Name            string                   `bson:"_id" json:"name"`
+	Version         int                      `bson:"version" json:"version"`
+	Term            int                      `bson:"term,omitempty" json:"term,omitempty"`
+	ProtocolVersion int                      `bson:"protocolVersion,omitempty" json:"protocol_version,omitempty"`
+	Members         []replicaSetConfigMember `bson:"members" json:"members"`
+	Extra           map[string]interface{}   `bson:",inline" json:"extra,omitempty"`
+}
+
+type replicaSetConfigMember struct {
+	ID       int                    `bson:"_id" json:"id"`
+	Address  string                 `bson:"host" json:"address"`
+	Arbiter  *bool                  `bson:"arbiterOnly,omitempty" json:"arbiter_only,omitempty"`
+	Priority *float64               `bson:"priority,omitempty" json:"priority,omitempty"`
+	Tags     map[string]string      `bson:"tags,omitempty" json:"tags,omitempty"`
+	Votes    *int                   `bson:"votes,omitempty" json:"votes,omitempty"`
+	Extra    map[string]interface{} `bson:",inline" json:"extra,omitempty"`
+}
+
+type replicaSetStatus struct {
+	Members []replicaSetStatusMember `bson:"members"`
+}
+
+type replicaSetStatusMember struct {
+	ID      int     `bson:"_id"`
+	Address string  `bson:"name"`
+	State   int     `bson:"state"`
+	Health  float64 `bson:"health"`
+}
+
+type machineNetworkDoc struct {
+	Addresses        []machineAddress `bson:"addresses"`
+	MachineAddresses []machineAddress `bson:"machineaddresses"`
+}
+
+type machineAddress struct {
+	Value string `bson:"value"`
+	Scope string `bson:"networkscope"`
 }
 
 type applicationChange struct {
@@ -230,13 +295,18 @@ func drive(a driveArgs) error {
 
 	const remoteBin = "/tmp/juju-controller-evict"
 	const remoteBackup = "/tmp/juju-controller-evict-backup.json"
+	keepRemoteBackup := false
 
 	fmt.Println("copying tool to the controller...")
 	if err := juju("scp", "-m", model, self, runner+":"+remoteBin); err != nil {
 		return fmt.Errorf("copying tool: %w", err)
 	}
 	defer func() {
-		if err := juju("ssh", "-m", model, runner, "sudo rm -f "+remoteBin+" "+remoteBackup); err != nil {
+		cleanup := "sudo rm -f " + remoteBin
+		if !keepRemoteBackup {
+			cleanup += " " + remoteBackup
+		}
+		if err := juju("ssh", "-m", model, runner, cleanup); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: leaving %s on %s: %v\n", remoteBin, runner, err)
 		}
 	}()
@@ -258,18 +328,20 @@ func drive(a driveArgs) error {
 
 	fmt.Println("running on the controller:")
 	fmt.Println("----")
-	if err := jujuStream("ssh", "-m", model, runner, remote); err != nil {
-		return fmt.Errorf("running tool on %s: %w", runner, err)
-	}
+	runErr := jujuStream("ssh", "-m", model, runner, remote)
 	fmt.Println("----")
 
 	if a.apply && a.machine != "" && !a.skipMongo {
 		local := "juju-controller-evict-backup-" + a.machine + ".json"
 		if err := juju("scp", "-m", model, runner+":"+remoteBackup, local); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not fetch backup: %v\n", err)
+			keepRemoteBackup = true
+			fmt.Fprintf(os.Stderr, "warning: could not fetch backup: %v; backup retained at %s:%s\n", err, runner, remoteBackup)
 		} else {
 			fmt.Printf("backup fetched to %s\n", local)
 		}
+	}
+	if runErr != nil {
+		return fmt.Errorf("running tool on %s: %w", runner, runErr)
 	}
 	return nil
 }
@@ -373,11 +445,14 @@ func run(a runArgs) error {
 		return fmt.Errorf("refusing to evict machine %s: that is the machine this tool is running on", a.machine)
 	}
 
-	session, err := dialMongo(localTag, conf, a.mongoCA, a.mongoCert)
+	session, directMongo, err := dialMongo(localTag, conf, a.mongoCA, a.mongoCert)
 	if err != nil {
 		return err
 	}
 	defer session.Close()
+	if directMongo {
+		fmt.Println("mongo: no replica set primary reachable; connected directly to the local member")
+	}
 
 	members, err := replSetMembers(session)
 	if err != nil {
@@ -408,24 +483,46 @@ func run(a runArgs) error {
 	}
 
 	target, ok := memberForMachine(members, a.machine)
+	dqliteAlreadyRemoved := false
 	if !ok {
-		return fmt.Errorf("no Mongo replica set member is tagged with juju-machine-id %q", a.machine)
+		target, dqliteAlreadyRemoved, err = removedMemberForMachine(session, conf.ModelUUID, a.machine, nodes, conf.statePort())
+		if err != nil {
+			return fmt.Errorf("no Mongo replica set member is tagged with juju-machine-id %q and the removal cannot be resumed: %w", a.machine, err)
+		}
 	}
-	if err := confirmDead(session, a.machine); err != nil {
-		return err
+	var replicaSetEviction *replicaSetEviction
+	if ok && target.Votes > 0 {
+		if a.skipMongo {
+			return fmt.Errorf("member %s still has a vote; cannot force-remove it with -skip-mongo", target.Address)
+		}
+		replicaSetEviction, err = planForcedReplicaSetEviction(session, target)
+		if err != nil {
+			return err
+		}
+	} else if ok {
+		if err := confirmDead(session, a.machine); err != nil {
+			return err
+		}
 	}
-	if target.Votes > 0 {
-		return fmt.Errorf("member %s still has a vote; wait for the peer grouper to demote it", target.Address)
+	if directMongo && !a.skipMongo && (replicaSetEviction == nil || !replicaSetEviction.NoPrimary) {
+		return fmt.Errorf("direct Mongo connection is only permitted for a forced voter eviction when every status sample has no primary")
+	}
+	if target.Address == "" && !dqliteAlreadyRemoved {
+		return fmt.Errorf("cannot determine the address of controller machine %s", a.machine)
 	}
 
-	host, _, err := net.SplitHostPort(target.Address)
-	if err != nil {
-		return fmt.Errorf("parsing member address %q: %w", target.Address, err)
+	host := "Dqlite node already removed"
+	dqliteAddr := ""
+	if target.Address != "" {
+		host, _, err = net.SplitHostPort(target.Address)
+		if err != nil {
+			return fmt.Errorf("parsing member address %q: %w", target.Address, err)
+		}
+		dqliteAddr = net.JoinHostPort(host, fmt.Sprint(conf.dqlitePort()))
 	}
-	dqliteAddr := net.JoinHostPort(host, fmt.Sprint(conf.dqlitePort()))
 
 	var dqliteNode *dqlite.NodeInfo
-	if !a.skipDqlite {
+	if !a.skipDqlite && !dqliteAlreadyRemoved {
 		node, err := nodeForAddress(nodes, dqliteAddr)
 		if err != nil {
 			return err
@@ -440,15 +537,17 @@ func run(a runArgs) error {
 	}
 
 	p := plan{
-		Machine:       a.machine,
-		MemberAddress: target.Address,
-		DqliteAddress: dqliteAddr,
+		Machine:            a.machine,
+		ModelUUID:          conf.ModelUUID,
+		MemberAddress:      target.Address,
+		ReplicaSetEviction: replicaSetEviction,
+		DqliteAddress:      dqliteAddr,
 	}
 	if dqliteNode != nil {
 		p.DqliteNodeID = dqliteNode.ID
 	}
 	if !a.skipMongo {
-		if err := planMongo(session, a.machine, &p); err != nil {
+		if err := planMongo(session, conf.ModelUUID, a.machine, &p); err != nil {
 			return err
 		}
 	}
@@ -460,17 +559,57 @@ func run(a runArgs) error {
 		fmt.Println("\ndry run: nothing was changed. Re-run with -yes to apply.")
 		return nil
 	}
-	if len(p.Delete) > 0 {
+	if !a.skipMongo {
 		if err := writeBackup(a.backup, &p); err != nil {
 			return err
 		}
 		backupDocuments := len(p.Delete) + len(p.Applications) + 1
+		if p.ReplicaSetEviction != nil {
+			backupDocuments++
+		}
 		fmt.Printf("\nbackup of %d documents written to %s\n", backupDocuments, a.backup)
 	}
 
 	if !a.skipMongo {
+		if p.ReplicaSetEviction != nil {
+			if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
+				return err
+			}
+		}
 		if err := revalidateMongoPlan(session, &p); err != nil {
 			return err
+		}
+		if p.ReplicaSetEviction != nil {
+			forced := false
+			var err error
+			if directMongo {
+				forced = true
+				err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, true)
+			} else {
+				err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, false)
+				if isQuorumCheckFailure(err) {
+					if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
+						return err
+					}
+					if err := revalidateMongoPlan(session, &p); err != nil {
+						return err
+					}
+					err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, true)
+					forced = true
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if forced {
+				reason := "after the normal reconfig lost quorum"
+				if directMongo {
+					reason = "because no primary was available"
+				}
+				fmt.Printf("mongo: replica set member %d (%s) force-removed %s\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress, reason)
+			} else {
+				fmt.Printf("mongo: replica set member %d (%s) removed with a normal reconfig\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress)
+			}
 		}
 		if err := applyMongo(session, &p); err != nil {
 			return err
@@ -494,7 +633,7 @@ func run(a runArgs) error {
 		printNodes(nodes, leader)
 	}
 
-	fmt.Printf("\ndone. Watch 'juju status' until machine %s disappears, then re-run 'juju enable-ha' to restore three voters.\n", a.machine)
+	fmt.Printf("\ndone. Watch 'juju status' until machine %s disappears, then run 'juju enable-ha -c <controller>' to restore three voters.\n", a.machine)
 	return nil
 }
 
@@ -520,26 +659,31 @@ func loadAgentConf(path string) (*agentConf, error) {
 	if err := yaml.Unmarshal(data, &conf); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	if conf.ControllerCert == "" || conf.StatePassword == "" {
+	if conf.ControllerCert == "" || conf.StatePassword == "" || conf.ModelTag == "" {
 		return nil, fmt.Errorf("%s is not a controller agent.conf", path)
 	}
+	const modelTagPrefix = "model-"
+	if !strings.HasPrefix(conf.ModelTag, modelTagPrefix) || len(conf.ModelTag) == len(modelTagPrefix) {
+		return nil, fmt.Errorf("%s has an invalid model tag", path)
+	}
+	conf.ModelUUID = strings.TrimPrefix(conf.ModelTag, modelTagPrefix)
 	return &conf, nil
 }
 
 // ---------- mongo ----------
 
-func dialMongo(localTag string, conf *agentConf, caPath, certPath string) (*mgo.Session, error) {
+func dialMongo(localTag string, conf *agentConf, caPath, certPath string) (*mgo.Session, bool, error) {
 	caPEM, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading mongo CA: %w", err)
+		return nil, false, fmt.Errorf("reading mongo CA: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("no certificate found in %s", caPath)
+		return nil, false, fmt.Errorf("no certificate found in %s", caPath)
 	}
 	cert, err := tls.LoadX509KeyPair(certPath, certPath)
 	if err != nil {
-		return nil, fmt.Errorf("loading mongo client certificate: %w", err)
+		return nil, false, fmt.Errorf("loading mongo client certificate: %w", err)
 	}
 	tlsConfig := &tls.Config{
 		MinVersion:   tls.VersionTLS12,
@@ -573,10 +717,28 @@ func dialMongo(localTag string, conf *agentConf, caPath, certPath string) (*mgo.
 	}
 	session, err := mgo.DialWithInfo(info)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to mongo at %s: %w", addr, err)
+		if !isNoReachableServers(err) {
+			return nil, false, fmt.Errorf("connecting to mongo at %s: %w", addr, err)
+		}
+		replicaSetErr := err
+		directInfo := *info
+		directInfo.Direct = true
+		session, err = mgo.DialWithInfo(&directInfo)
+		if err != nil {
+			return nil, false, fmt.Errorf("connecting to mongo at %s through the replica set failed (%v), and direct connection failed: %w", addr, replicaSetErr, err)
+		}
+		// A direct fallback must read status and run the forced reconfig on a
+		// non-primary member. Monotonic keeps that direct socket usable until
+		// the member becomes primary.
+		session.SetMode(mgo.Monotonic, true)
+		return session, true, nil
 	}
 	session.SetMode(mgo.Strong, true)
-	return session, nil
+	return session, false, nil
+}
+
+func isNoReachableServers(err error) bool {
+	return err != nil && err.Error() == "no reachable servers"
 }
 
 type member struct {
@@ -588,41 +750,48 @@ type member struct {
 	MachineID string
 }
 
-func replSetMembers(session *mgo.Session) ([]member, error) {
-	var status struct {
-		Members []struct {
-			ID     int     `bson:"_id"`
-			Name   string  `bson:"name"`
-			State  int     `bson:"state"`
-			Health float64 `bson:"health"`
-		} `bson:"members"`
-	}
-	if err := session.DB("admin").Run(bson.D{{Name: "replSetGetStatus", Value: 1}}, &status); err != nil {
+type mongoRunner interface {
+	Run(command, result interface{}) error
+	Refresh()
+}
+
+func currentReplicaSetStatus(session mongoRunner) (*replicaSetStatus, error) {
+	var status replicaSetStatus
+	if err := session.Run(bson.D{{Name: "replSetGetStatus", Value: 1}}, &status); err != nil {
 		return nil, fmt.Errorf("running replSetGetStatus: %w", err)
 	}
-	var conf struct {
-		Config struct {
-			Members []struct {
-				ID    int               `bson:"_id"`
-				Host  string            `bson:"host"`
-				Votes int               `bson:"votes"`
-				Tags  map[string]string `bson:"tags"`
-			} `bson:"members"`
-		} `bson:"config"`
+	return &status, nil
+}
+
+func currentReplicaSetConfig(session mongoRunner) (*replicaSetConfig, error) {
+	var result struct {
+		Config replicaSetConfig `bson:"config"`
 	}
-	if err := session.DB("admin").Run(bson.D{{Name: "replSetGetConfig", Value: 1}}, &conf); err != nil {
+	if err := session.Run(bson.D{{Name: "replSetGetConfig", Value: 1}}, &result); err != nil {
 		return nil, fmt.Errorf("running replSetGetConfig: %w", err)
+	}
+	return &result.Config, nil
+}
+
+func replSetMembers(session mongoRunner) ([]member, error) {
+	status, err := currentReplicaSetStatus(session)
+	if err != nil {
+		return nil, err
+	}
+	config, err := currentReplicaSetConfig(session)
+	if err != nil {
+		return nil, err
 	}
 	byID := map[int]member{}
 	for _, m := range status.Members {
-		byID[m.ID] = member{ID: m.ID, Address: m.Name, State: m.State, Health: m.Health}
+		byID[m.ID] = member{ID: m.ID, Address: m.Address, State: m.State, Health: m.Health}
 	}
 	var out []member
-	for _, c := range conf.Config.Members {
+	for _, c := range config.Members {
 		m := byID[c.ID]
 		m.ID = c.ID
-		m.Address = c.Host
-		m.Votes = c.Votes
+		m.Address = c.Address
+		m.Votes = memberVotes(c)
 		m.MachineID = c.Tags["juju-machine-id"]
 		out = append(out, m)
 	}
@@ -638,10 +807,48 @@ func memberForMachine(members []member, machine string) (member, bool) {
 	return member{}, false
 }
 
+func removedMemberForMachine(session *mgo.Session, modelUUID, machine string, nodes []dqlite.NodeInfo, statePort int) (member, bool, error) {
+	var doc machineNetworkDoc
+	if err := session.DB(stateDB).C("machines").Find(bson.M{"machineid": machine, "model-uuid": modelUUID}).One(&doc); err != nil {
+		return member{}, false, fmt.Errorf("reading machine %s addresses: %w", machine, err)
+	}
+	address, dqliteAlreadyRemoved, err := removedMemberAddress(&doc, nodes, statePort)
+	if err != nil {
+		return member{}, false, err
+	}
+	return member{Address: address, MachineID: machine}, dqliteAlreadyRemoved, nil
+}
+
+func removedMemberAddress(doc *machineNetworkDoc, nodes []dqlite.NodeInfo, statePort int) (string, bool, error) {
+	hosts := map[string]bool{}
+	for _, address := range append(doc.Addresses, doc.MachineAddresses...) {
+		if address.Scope != "local-machine" && address.Value != "" {
+			hosts[address.Value] = true
+		}
+	}
+	var matches []string
+	for _, node := range nodes {
+		host, _, err := net.SplitHostPort(node.Address)
+		if err != nil {
+			return "", false, fmt.Errorf("parsing Dqlite node address %q: %w", node.Address, err)
+		}
+		if hosts[host] {
+			matches = append(matches, host)
+		}
+	}
+	if len(matches) == 0 {
+		return "", true, nil
+	}
+	if len(matches) > 1 {
+		return "", false, fmt.Errorf("machine addresses match %d Dqlite nodes, need at most one", len(matches))
+	}
+	return net.JoinHostPort(matches[0], fmt.Sprint(statePort)), false, nil
+}
+
 // confirmDead re-reads the replica set status a few times. The target must be
-// unhealthy and DOWN in every sample, so a member that is merely slow or
-// briefly partitioned is never treated as dead.
-func confirmDead(session *mgo.Session, machine string) error {
+// unhealthy and DOWN or UNKNOWN in every sample, so a member that is merely
+// slow or briefly partitioned is never treated as dead.
+func confirmDead(session mongoRunner, machine string) error {
 	for i := 0; i < deadSamples; i++ {
 		if i > 0 {
 			time.Sleep(deadInterval)
@@ -654,23 +861,286 @@ func confirmDead(session *mgo.Session, machine string) error {
 		if !ok {
 			return fmt.Errorf("machine %s vanished from the replica set config while checking", machine)
 		}
-		if m.Health != 0 || m.State != downState {
+		if m.Health != 0 || (m.State != downState && m.State != unknownState) {
 			return fmt.Errorf("member %s is not dead (state=%d health=%v); refusing to evict", m.Address, m.State, m.Health)
 		}
 	}
 	return nil
 }
 
-func planMongo(session *mgo.Session, machine string, p *plan) error {
+func memberVotes(member replicaSetConfigMember) int {
+	if member.Votes == nil {
+		return 1
+	}
+	return *member.Votes
+}
+
+func canBecomePrimary(member replicaSetConfigMember) bool {
+	if memberVotes(member) == 0 || (member.Arbiter != nil && *member.Arbiter) {
+		return false
+	}
+	return member.Priority == nil || *member.Priority > 0
+}
+
+func planForcedReplicaSetEviction(session mongoRunner, target member) (*replicaSetEviction, error) {
+	config, err := currentReplicaSetConfig(session)
+	if err != nil {
+		return nil, err
+	}
+	found := false
+	for _, configured := range config.Members {
+		if configured.ID != target.ID {
+			continue
+		}
+		found = configured.Address == target.Address
+		if !found {
+			return nil, fmt.Errorf("replica set member %d address changed from %s to %s", target.ID, target.Address, configured.Address)
+		}
+		if memberVotes(configured) == 0 {
+			return nil, fmt.Errorf("replica set member %d is no longer a voter; retry the command", target.ID)
+		}
+		break
+	}
+	if !found {
+		return nil, fmt.Errorf("replica set member %d (%s) is no longer configured; retry the command", target.ID, target.Address)
+	}
+
+	samples := make([]replicaSetStatus, 0, deadSamples)
+	for i := 0; i < deadSamples; i++ {
+		if i > 0 {
+			time.Sleep(deadInterval)
+		}
+		status, err := currentReplicaSetStatus(session)
+		if err != nil {
+			return nil, fmt.Errorf("assessing replica set eviction: %w", err)
+		}
+		samples = append(samples, *status)
+	}
+	if err := assessForcedReplicaSetEviction(config, target.ID, samples); err != nil {
+		return nil, err
+	}
+	return &replicaSetEviction{
+		MemberID:      target.ID,
+		MemberAddress: target.Address,
+		NoPrimary:     replicaSetSamplesHaveNoPrimary(samples),
+		Config:        *config,
+	}, nil
+}
+
+func replicaSetSamplesHaveNoPrimary(samples []replicaSetStatus) bool {
+	for _, status := range samples {
+		for _, member := range status.Members {
+			if member.State == primaryState && member.Health != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func assessForcedReplicaSetEviction(config *replicaSetConfig, targetID int, samples []replicaSetStatus) error {
+	if len(samples) != deadSamples {
+		return fmt.Errorf("replica set eviction requires %d status samples, got %d", deadSamples, len(samples))
+	}
+	voting := map[int]bool{}
+	primaryEligible := map[int]bool{}
+	targetConfigured := false
+	for _, member := range config.Members {
+		if member.ID == targetID {
+			targetConfigured = true
+		}
+		if memberVotes(member) > 0 {
+			voting[member.ID] = true
+		}
+		if canBecomePrimary(member) {
+			primaryEligible[member.ID] = true
+		}
+	}
+	if !targetConfigured {
+		return fmt.Errorf("replica set member %d is not configured", targetID)
+	}
+
+	targetDead := true
+	var liveVoting, livePrimaryEligible, unhealthyOtherVoting map[int]bool
+	for i, status := range samples {
+		deadNow := false
+		liveVotingNow := map[int]bool{}
+		livePrimaryEligibleNow := map[int]bool{}
+		unhealthyOtherVotingNow := map[int]bool{}
+		for _, member := range status.Members {
+			if member.Health != 0 {
+				if voting[member.ID] {
+					liveVotingNow[member.ID] = true
+				}
+				if primaryEligible[member.ID] && (member.State == primaryState || member.State == secondaryState) {
+					livePrimaryEligibleNow[member.ID] = true
+				}
+				continue
+			}
+			if member.ID == targetID && (member.State == downState || member.State == unknownState) {
+				deadNow = true
+			}
+			if voting[member.ID] && member.ID != targetID {
+				unhealthyOtherVotingNow[member.ID] = true
+			}
+		}
+		targetDead = targetDead && deadNow
+		if i == 0 {
+			liveVoting = liveVotingNow
+			livePrimaryEligible = livePrimaryEligibleNow
+			unhealthyOtherVoting = unhealthyOtherVotingNow
+			continue
+		}
+		liveVoting = intersectIDs(liveVoting, liveVotingNow)
+		livePrimaryEligible = intersectIDs(livePrimaryEligible, livePrimaryEligibleNow)
+		unhealthyOtherVoting = intersectIDs(unhealthyOtherVoting, unhealthyOtherVotingNow)
+	}
+
+	if !targetDead {
+		return fmt.Errorf("replica set member %d did not remain DOWN or UNKNOWN across all samples", targetID)
+	}
+	if len(unhealthyOtherVoting) > 0 {
+		return fmt.Errorf("voters %v are unhealthy but not removal targets", sortedIDs(unhealthyOtherVoting))
+	}
+
+	remainingVoters := 0
+	for id := range voting {
+		if id != targetID {
+			remainingVoters++
+		}
+	}
+	liveVoters := 0
+	for id := range liveVoting {
+		if id != targetID {
+			liveVoters++
+		}
+	}
+	needed := (remainingVoters / 2) + 1
+	if liveVoters < needed {
+		return fmt.Errorf("evicting member %d leaves %d live voters of %d, but a majority needs %d", targetID, liveVoters, remainingVoters, needed)
+	}
+	if len(livePrimaryEligible) == 0 {
+		return fmt.Errorf("evicting member %d leaves no live primary-eligible member", targetID)
+	}
+	return nil
+}
+
+func intersectIDs(left, right map[int]bool) map[int]bool {
+	intersection := map[int]bool{}
+	for id := range left {
+		if right[id] {
+			intersection[id] = true
+		}
+	}
+	return intersection
+}
+
+func sortedIDs(ids map[int]bool) []int {
+	values := make([]int, 0, len(ids))
+	for id := range ids {
+		values = append(values, id)
+	}
+	sort.Ints(values)
+	return values
+}
+
+func revalidateReplicaSetEviction(session mongoRunner, planned *replicaSetEviction) error {
+	fresh, err := planForcedReplicaSetEviction(session, member{ID: planned.MemberID, Address: planned.MemberAddress})
+	if err != nil {
+		return fmt.Errorf("revalidating forced replica set eviction: %w", err)
+	}
+	if !reflect.DeepEqual(planned, fresh) {
+		return fmt.Errorf("replica set config changed after planning; no changes were applied, retry the command")
+	}
+	return nil
+}
+
+func reconfigureReplicaSetWithoutMember(session mongoRunner, eviction *replicaSetEviction, force bool) error {
+	config := eviction.Config
+	config.Version++
+	config.Members = make([]replicaSetConfigMember, 0, len(eviction.Config.Members)-1)
+	found := false
+	for _, member := range eviction.Config.Members {
+		if member.ID == eviction.MemberID {
+			found = true
+			continue
+		}
+		config.Members = append(config.Members, member)
+	}
+	if !found {
+		return fmt.Errorf("replica set member %d is missing from the planned config", eviction.MemberID)
+	}
+
+	command := bson.D{{Name: "replSetReconfig", Value: config}}
+	if force {
+		command = append(command, bson.DocElem{Name: "force", Value: true})
+	}
+	err := session.Run(command, nil)
+	if err == io.EOF {
+		session.Refresh()
+	} else if err != nil {
+		return fmt.Errorf("removing replica set member %d: %w", eviction.MemberID, err)
+	}
+	var lastStatusErr error
+	for i := 0; i < primaryPollAttempts; i++ {
+		status, err := currentReplicaSetStatus(session)
+		if err != nil {
+			lastStatusErr = err
+			session.Refresh()
+		} else {
+			for _, member := range status.Members {
+				if member.State == primaryState {
+					return nil
+				}
+			}
+		}
+		if i+1 < primaryPollAttempts {
+			time.Sleep(primaryPollInterval)
+		}
+	}
+	if lastStatusErr != nil {
+		return fmt.Errorf("no MongoDB primary elected after removing member %d; last status check failed: %w", eviction.MemberID, lastStatusErr)
+	}
+	return fmt.Errorf("no MongoDB primary elected after removing member %d", eviction.MemberID)
+}
+
+func isQuorumCheckFailure(err error) bool {
+	// Code 11602 also identifies a primary transition, so it is not enough to
+	// permit a forced reconfig without MongoDB's explicit quorum-check message.
+	var queryError *mgo.QueryError
+	return errors.As(err, &queryError) && queryError != nil &&
+		strings.Contains(queryError.Message, "Quorum check failed")
+}
+
+func planMongo(session *mgo.Session, modelUUID, machine string, p *plan) error {
 	db := session.DB(stateDB)
 	appDecrements := map[string]int{}
+	if p.ModelUUID == "" {
+		p.ModelUUID = modelUUID
+	} else if p.ModelUUID != modelUUID {
+		return fmt.Errorf("plan model %s does not match controller model %s", p.ModelUUID, modelUUID)
+	}
+	p.MachineDocID = p.ModelUUID + ":" + machine
+	if err := db.C("machines").FindId(p.MachineDocID).One(&p.MachineDoc); err != nil {
+		return fmt.Errorf("reading machine %s doc: %w", machine, err)
+	}
+	if err := assertNoPendingTxn(p.MachineDoc, "machines", p.MachineDocID); err != nil {
+		return err
+	}
 
 	var units []map[string]interface{}
-	if err := db.C("units").Find(bson.M{"machineid": machine}).All(&units); err != nil {
+	if err := db.C("units").Find(bson.M{"machineid": machine, "model-uuid": modelUUID}).All(&units); err != nil {
 		return fmt.Errorf("finding units on machine %s: %w", machine, err)
 	}
 	if len(units) == 0 {
-		return fmt.Errorf("no unit documents reference machine %s; nothing to clean up in Mongo", machine)
+		principals, err := machinePrincipals(p.MachineDoc)
+		if err != nil {
+			return fmt.Errorf("machines/%s: %w", p.MachineDocID, err)
+		}
+		if len(principals) > 0 {
+			return fmt.Errorf("no unit documents reference machine %s but the machine still has principals", machine)
+		}
+		return nil
 	}
 
 	for _, u := range units {
@@ -689,14 +1159,12 @@ func planMongo(session *mgo.Session, machine string, p *plan) error {
 		if err := assertNoPendingTxn(u, "units", id); err != nil {
 			return err
 		}
-		modelUUID, ok := u["model-uuid"].(string)
-		if !ok || modelUUID == "" {
+		unitModelUUID, ok := u["model-uuid"].(string)
+		if !ok || unitModelUUID == "" {
 			return fmt.Errorf("units/%s has no string model-uuid", id)
 		}
-		if p.ModelUUID == "" {
-			p.ModelUUID = modelUUID
-		} else if p.ModelUUID != modelUUID {
-			return fmt.Errorf("units on machine %s belong to different models", machine)
+		if unitModelUUID != p.ModelUUID {
+			return fmt.Errorf("units/%s belongs to model %s, expected %s", id, unitModelUUID, p.ModelUUID)
 		}
 		p.Units = append(p.Units, name)
 		p.Delete = append(p.Delete, deletion{Collection: "units", ID: id, Doc: u})
@@ -705,7 +1173,7 @@ func planMongo(session *mgo.Session, machine string, p *plan) error {
 		re := unitDocRegexp(name)
 		for _, coll := range unitDocCollections {
 			var docs []map[string]interface{}
-			if err := db.C(coll).Find(bson.M{"_id": bson.M{"$regex": re}}).All(&docs); err != nil {
+			if err := db.C(coll).Find(bson.M{"_id": bson.M{"$regex": re}, "model-uuid": modelUUID}).All(&docs); err != nil {
 				return fmt.Errorf("finding %s documents for %s: %w", coll, name, err)
 			}
 			for _, d := range docs {
@@ -746,20 +1214,9 @@ func planMongo(session *mgo.Session, machine string, p *plan) error {
 		p.Applications = append(p.Applications, change)
 	}
 
-	// Snapshot the machine doc: we pull the units from its principals and later
-	// advance its life, and the backup must capture the original.
-	p.MachineDocID = p.ModelUUID + ":" + machine
-	var mdoc map[string]interface{}
-	if err := db.C("machines").FindId(p.MachineDocID).One(&mdoc); err != nil {
-		return fmt.Errorf("reading machine %s doc: %w", machine, err)
-	}
-	if err := assertNoPendingTxn(mdoc, "machines", p.MachineDocID); err != nil {
-		return err
-	}
-	if err := validateMachinePrincipals(mdoc, p.Units); err != nil {
+	if err := validateMachinePrincipals(p.MachineDoc, p.Units); err != nil {
 		return fmt.Errorf("machines/%s: %w", p.MachineDocID, err)
 	}
-	p.MachineDoc = mdoc
 	return nil
 }
 
@@ -784,26 +1241,9 @@ func applicationChangeFor(name, id string, decrement int, doc map[string]interfa
 }
 
 func validateMachinePrincipals(doc map[string]interface{}, units []string) error {
-	raw, ok := doc["principals"]
-	if !ok {
-		return fmt.Errorf("principals is missing")
-	}
-	principals := map[string]bool{}
-	switch values := raw.(type) {
-	case []interface{}:
-		for _, value := range values {
-			principal, ok := value.(string)
-			if !ok {
-				return fmt.Errorf("principals contains a non-string value")
-			}
-			principals[principal] = true
-		}
-	case []string:
-		for _, principal := range values {
-			principals[principal] = true
-		}
-	default:
-		return fmt.Errorf("principals is not an array")
+	principals, err := machinePrincipals(doc)
+	if err != nil {
+		return err
 	}
 	for _, unit := range units {
 		if !principals[unit] {
@@ -813,9 +1253,34 @@ func validateMachinePrincipals(doc map[string]interface{}, units []string) error
 	return nil
 }
 
+func machinePrincipals(doc map[string]interface{}) (map[string]bool, error) {
+	raw, ok := doc["principals"]
+	if !ok {
+		return nil, fmt.Errorf("principals is missing")
+	}
+	principals := map[string]bool{}
+	switch values := raw.(type) {
+	case []interface{}:
+		for _, value := range values {
+			principal, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("principals contains a non-string value")
+			}
+			principals[principal] = true
+		}
+	case []string:
+		for _, principal := range values {
+			principals[principal] = true
+		}
+	default:
+		return nil, fmt.Errorf("principals is not an array")
+	}
+	return principals, nil
+}
+
 func revalidateMongoPlan(session *mgo.Session, planned *plan) error {
-	fresh := plan{Machine: planned.Machine}
-	if err := planMongo(session, planned.Machine, &fresh); err != nil {
+	fresh := plan{Machine: planned.Machine, ModelUUID: planned.ModelUUID}
+	if err := planMongo(session, planned.ModelUUID, planned.Machine, &fresh); err != nil {
 		return fmt.Errorf("revalidating Mongo plan before write: %w", err)
 	}
 	if !sameMongoPlan(planned, &fresh) {
@@ -855,55 +1320,96 @@ func assertNoPendingTxn(doc map[string]interface{}, coll, id string) error {
 
 func applyMongo(session *mgo.Session, p *plan) error {
 	db := session.DB(stateDB)
-	for _, d := range p.Delete {
-		if err := db.C(d.Collection).RemoveId(d.ID); err != nil && err != mgo.ErrNotFound {
-			return fmt.Errorf("deleting %s/%s: %w", d.Collection, d.ID, err)
-		}
+	ops, err := mongoCleanupOps(p)
+	if err != nil {
+		return err
 	}
-	for _, app := range p.Applications {
-		err := db.C("applications").UpdateId(app.ID, bson.M{
-			"$inc": bson.M{"unitcount": -app.Decrement, "txn-revno": 1},
-		})
-		if err != nil {
-			return fmt.Errorf("decrementing unitcount of %s: %w", app.ID, err)
-		}
+	if len(ops) == 0 {
+		return nil
 	}
-	// Pull the removed units from the machine's principals. Without this the
-	// evacuate cleanup keeps trying to load the now-deleted units and errors,
-	// so the machine never advances out of Alive.
-	for _, name := range p.Units {
-		err := db.C("machines").UpdateId(p.MachineDocID, bson.M{
-			"$pull": bson.M{"principals": name},
-			"$inc":  bson.M{"txn-revno": 1},
-		})
-		if err != nil {
-			return fmt.Errorf("removing %s from machine principals: %w", name, err)
-		}
+	if err := sstxn.NewRunner(db, nil).Run(ops, "", nil); err != nil {
+		return fmt.Errorf("applying Mongo cleanup transaction: %w", err)
 	}
 	return nil
 }
 
-// advanceMachineDead lets Juju's own evacuate cleanup advance the machine from
-// Alive to Dying (which removes the controller reference and the Mongo member),
-// then sets it Dead so the live provisioner removes the machine and all of its
-// related documents with proper transactions. It never touches the heavy
-// removal itself.
+func mongoCleanupOps(p *plan) ([]txn.Op, error) {
+	// sstxn sets txn-revno to its previous value plus one for every update.
+	// Including it in an update here would modify the same field twice.
+	ops := make([]txn.Op, 0, len(p.Delete)+len(p.Applications)+1)
+	for _, d := range p.Delete {
+		assert, err := txnRevnoAssertion(d.Doc, d.Collection, d.ID)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, txn.Op{C: d.Collection, Id: d.ID, Assert: assert, Remove: true})
+	}
+	for _, app := range p.Applications {
+		assert, err := txnRevnoAssertion(app.Doc, "applications", app.ID)
+		if err != nil {
+			return nil, err
+		}
+		assert = append(assert, bson.DocElem{Name: "unitcount", Value: app.UnitCountBefore})
+		ops = append(ops, txn.Op{
+			C:      "applications",
+			Id:     app.ID,
+			Assert: assert,
+			Update: bson.M{"$inc": bson.M{"unitcount": -app.Decrement}},
+		})
+	}
+	if len(p.Units) > 0 {
+		assert, err := txnRevnoAssertion(p.MachineDoc, "machines", p.MachineDocID)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, txn.Op{
+			C:      "machines",
+			Id:     p.MachineDocID,
+			Assert: assert,
+			Update: bson.M{"$pullAll": bson.M{"principals": p.Units}},
+		})
+	}
+	return ops, nil
+}
+
+func txnRevnoAssertion(doc map[string]interface{}, collection, id string) (bson.D, error) {
+	revno, ok := doc["txn-revno"]
+	if !ok {
+		return nil, fmt.Errorf("%s/%s has no txn-revno", collection, id)
+	}
+	return bson.D{{Name: "txn-revno", Value: revno}}, nil
+}
+
+// advanceMachineDead waits for Juju's own cleanup to advance the machine from
+// Alive to Dying and remove its controller reference. It then sets the machine
+// Dead so the live provisioner removes it and its related documents with proper
+// transactions. It never performs that heavy removal itself.
 func advanceMachineDead(session *mgo.Session, p *plan) error {
 	db := session.DB(stateDB)
 	deadline := time.Now().Add(dyingWait)
 	for {
+		controllerRegistered, err := controllerReferencePresent(db, p.Machine)
+		if err != nil {
+			return err
+		}
 		var m struct {
 			Life int `bson:"life"`
 		}
-		err := db.C("machines").FindId(p.MachineDocID).One(&m)
+		err = db.C("machines").FindId(p.MachineDocID).One(&m)
 		if err == mgo.ErrNotFound {
-			return nil // already removed
+			if controllerRegistered {
+				return fmt.Errorf("machine %s was removed while its controller reference still exists", p.Machine)
+			}
+			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("reading machine life: %w", err)
 		}
 		switch m.Life {
 		case lifeDying:
+			if controllerRegistered {
+				break
+			}
 			// Assert still Dying so we do not race the cleanup.
 			err := db.C("machines").Update(
 				bson.M{"_id": p.MachineDocID, "life": lifeDying},
@@ -914,13 +1420,31 @@ func advanceMachineDead(session *mgo.Session, p *plan) error {
 			}
 			return nil
 		case lifeDead:
+			if controllerRegistered {
+				return fmt.Errorf("machine %s is Dead but its controller reference still exists", p.Machine)
+			}
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("machine %s did not reach Dying within %s; is 'juju remove-machine --force' pending?", p.Machine, dyingWait)
+			return fmt.Errorf("machine %s did not finish controller cleanup within %s; is 'juju remove-machine --force' pending?", p.Machine, dyingWait)
 		}
 		time.Sleep(dyingPollTick)
 	}
+}
+
+func controllerReferencePresent(db *mgo.Database, machine string) (bool, error) {
+	var doc struct {
+		ControllerIDs []string `bson:"controller-ids"`
+	}
+	if err := db.C(controllersC).FindId(modelGlobalKey).One(&doc); err != nil {
+		return false, fmt.Errorf("reading controller references: %w", err)
+	}
+	for _, id := range doc.ControllerIDs {
+		if id == machine {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func writeBackup(path string, p *plan) error {
@@ -1028,6 +1552,22 @@ func printNodes(nodes []dqlite.NodeInfo, leader *dqlite.NodeInfo) {
 }
 
 func printPlan(w io.Writer, p *plan) {
+	if p.ReplicaSetEviction != nil {
+		action := "remove"
+		reason := "force only if the normal reconfig loses quorum"
+		if p.ReplicaSetEviction.NoPrimary {
+			action = "force-remove"
+			reason = "no primary is available"
+		}
+		fmt.Fprintf(w, "  mongo: %s replica set member %d (%s), config version %d -> %d; %s\n",
+			action,
+			p.ReplicaSetEviction.MemberID,
+			p.ReplicaSetEviction.MemberAddress,
+			p.ReplicaSetEviction.Config.Version,
+			p.ReplicaSetEviction.Config.Version+1,
+			reason,
+		)
+	}
 	for _, d := range p.Delete {
 		fmt.Fprintf(w, "  mongo: delete %s/%s\n", d.Collection, d.ID)
 	}

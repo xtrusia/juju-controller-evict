@@ -1,149 +1,96 @@
 # juju-controller-evict
 
-Remove a permanently dead Juju HA controller from a live controller cluster,
-without bringing the dead machine back.
+`juju-controller-evict` removes a permanently dead Juju 3.6 HA controller from a live controller cluster without starting the dead machine again.
 
-## The problem
+This is a recovery tool for affected Juju 3.6 controllers. It edits Juju state in MongoDB and removes a Dqlite member. Use it only when the controller machine is permanently unavailable.
 
-A Juju HA controller runs three independent clusters at once.
-The MongoDB replica set holds model state.
-The Dqlite cluster holds controller state in Juju 3.6.
-The controller charm has its own leadership.
+## When to use it
 
-When a controller machine is powered off for good and you run
-`juju remove-machine <id> -m controller --force`, the command returns but the
-machine never leaves.
-Two things block it.
+Use this tool only when all of these conditions are true:
 
-1. The `evacuateMachine` cleanup waits for the dead machine agent to tear down
-   its controller unit. `juju remove-unit` does not work either, because Juju
-   refuses to remove units of the controller application.
-2. A Dqlite node is removed only by the departing node's own handover. The
-   surviving nodes never evict it. So the dead node stays a cluster member.
+- The controller machine will not return.
+- You already ran `juju remove-machine <id> -m controller --force`.
+- The remaining controllers have quorum and answer `juju status`.
+- The dead MongoDB member reports `DOWN` and has no vote.
 
-The result is a machine stuck in `down`, a stale MongoDB member, and a stale
-Dqlite node that never go away on their own.
-
-## What this tool does
-
-The work happens on a surviving controller. It makes the smallest change
-needed, then lets Juju's own workers finish the removal with normal
-transactions. You normally start it from a Juju client and it reaches the
-controller for you (see Usage).
-
-For MongoDB, it deletes the dead machine's unit documents and pulls the unit
-from the machine's principals. The live cleanup worker then advances the
-machine to `Dying`, which also removes the controller reference and the dead
-replica set member. The tool then sets the machine `Dead`, and the live
-provisioner removes the machine and all of its related documents. The tool does
-not rebuild the machine removal by hand.
-
-For Dqlite, it connects to the cluster leader and removes the dead node.
-
-## Preconditions
-
-- The dead controller is never coming back. If you can boot it, just start it
-  and `juju remove-machine` works on its own.
-- You already ran `juju remove-machine <id> -m controller --force`. That
-  schedules the cleanup this tool unblocks.
-- The controller still has quorum and answers `juju status`.
-- The dead member reports `DOWN` in the MongoDB replica set. The tool checks
-  this three times before it acts.
-- The dead member no longer has a vote. After you force-remove the machine, the
-  peer grouper demotes it to a non-voting member. The tool refuses while the
-  member still has a vote, so you may need to wait a short time.
+If the machine can be recovered, start it and let Juju remove it normally.
 
 ## Usage
 
-From a Juju client, as an admin.
+Run the binary from a Juju client logged in as a controller administrator.
 
-    # report only, change nothing
-    juju-controller-evict -controller mycontroller
+```text
+# Show the MongoDB and Dqlite members.
+juju-controller-evict -controller mycontroller
 
-    # dry run for machine 1
-    juju-controller-evict -controller mycontroller -machine 1
+# Check the removal plan for machine 1 without changing anything.
+juju-controller-evict -controller mycontroller -machine 1
 
-    # apply
-    juju-controller-evict -controller mycontroller -machine 1 -yes
+# Apply the plan.
+juju-controller-evict -controller mycontroller -machine 1 -yes
+```
 
-In this mode the JSON backup is copied back to the client as
-`juju-controller-evict-backup-<machine>.json`.
+Without `-yes`, the tool does not change MongoDB or Dqlite.
 
-### How the client mode works
+The client copies the binary to a surviving controller and runs it there with `sudo`. The binary must be built for the controller architecture, usually Linux `amd64` or `arm64`.
 
-The tool uses your local `juju` client. You must be logged in as an admin of
-the controller.
+You can also run it directly on a surviving controller:
 
-1. It asks `juju status` for the controller machines and picks one that is
-   `started` and is not the machine you are removing.
-2. It copies the running binary to `/tmp` on that machine with `juju scp`.
-3. It runs the copy there with `juju ssh` and `sudo`, and streams the output
-   back to you.
-4. On apply, it copies the JSON backup back to the client.
-5. It removes the binary from the controller when it is done.
+```text
+sudo ./juju-controller-evict -machine 1 -yes
+```
 
-Because it copies itself, the binary must be a Linux binary that matches the
-controller architecture (`amd64` or `arm64`). Run it from a Linux client or
-bastion that can reach the controller with `juju`. If your workstation is a
-different OS, copy the matching Linux binary to such a host and run it from
-there.
+## What it changes
 
-You can also run it directly on a surviving controller machine as root. In that
-mode it reads the local `agent.conf` and does not use `juju scp`.
+The tool removes the dead controller unit documents that block Juju cleanup. Juju then removes the controller reference and MongoDB replica-set member. The tool marks the machine `Dead` so the provisioner can finish removing it.
 
-    sudo ./juju-controller-evict -machine 1 -yes
+It also removes the matching Dqlite node from the cluster.
 
-After it finishes, watch `juju status` until the machine disappears, then run
-`juju enable-ha` to restore three voters.
+Before changing MongoDB, the tool writes the selected unit documents, the original machine document, and the planned application unit-count changes to a JSON file. Client mode copies this file back as `juju-controller-evict-backup-<machine>.json`.
 
-### Flags
+## Safety checks
 
-- `-machine` machine id of the dead controller. Omit to only print cluster state.
-- `-controller` controller name when run from a client. Default is the current
-  controller.
-- `-yes` apply the changes. Without it the tool only reports and writes a backup.
-- `-skip-mongo` leave the Juju state documents alone. This makes it a Dqlite
-  only tool.
-- `-skip-dqlite` leave the Dqlite cluster alone.
-- `-backup` path for the JSON backup of every document it deletes or changes.
-- `-agent-conf` path to a controller `agent.conf`. Passing it forces the
-  on-controller worker mode.
-- `-cluster` path to the Dqlite `cluster.yaml`. Default is
-  `/var/lib/juju/dqlite/cluster.yaml`.
-- `-mongo-ca`, `-mongo-cert` paths to the CA and client certificate mongod was
-  started with. Defaults point at the `juju-db` snap.
-- `-timeout` overall timeout.
+The tool refuses to apply changes unless:
 
-## Safety
+- `-yes` is present.
+- The target is not the controller running the tool.
+- The MongoDB member is unhealthy and remains `DOWN` across three checks.
+- The MongoDB member is already non-voting.
+- The target Dqlite node is not the current leader.
+- The target no longer answers on its Dqlite port.
 
-This tool edits the controller state database directly. Use it only for a
-controller that is gone for good.
+This tool changes controller state directly. The JSON file is a record of the affected MongoDB state, not an automatic rollback.
 
-- It does nothing without `-yes`.
-- It writes a JSON backup of every document before it changes anything.
-- It refuses to touch the current Dqlite leader, or a node that still answers on
-  its Dqlite port.
-- It only acts on a MongoDB member that is unhealthy and `DOWN` across several
-  samples, so a short network blip cannot look like a dead node.
-- It refuses to run against the machine it is running on.
+## After removal
+
+Watch `juju status` until the machine disappears. Then restore the controller voter count:
+
+```text
+juju enable-ha
+```
+
+## Other options
+
+- `-skip-mongo` removes only the Dqlite node.
+- `-skip-dqlite` changes only the Juju state in MongoDB.
+- `-agent-conf` selects the controller agent configuration and forces direct controller mode.
+- `-backup` changes the JSON output path.
+- `-timeout` sets the Dqlite operation timeout.
+
+Run `juju-controller-evict -help` for all path and connection options.
 
 ## Limitations
 
-- Tested with Juju 3.6 (MongoDB replica set plus Dqlite). Older or newer Juju
-  may store state differently.
-- It removes one dead controller at a time.
-- After removal the Dqlite cluster has fewer voters. Run `juju enable-ha` to
-  restore the voter count.
+- Tested with Juju 3.6 only.
+- Removes one dead controller at a time.
+- Requires a MongoDB primary and a Dqlite leader on the surviving controllers.
 
 ## Build
 
-Static binary, no cgo. It links only the pure Go Dqlite client, not the C
-backed Dqlite app.
-
-    CGO_ENABLED=0 go build -o juju-controller-evict .
-
-Copy the binary to the client or controller and run it.
+```text
+CGO_ENABLED=0 go build -o juju-controller-evict .
+```
 
 ## License
 
-Apache-2.0. See LICENSE.
+Apache-2.0. See [LICENSE](LICENSE).

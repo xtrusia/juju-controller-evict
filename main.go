@@ -319,7 +319,11 @@ func drive(a driveArgs) error {
 	fmt.Println("----")
 
 	if a.apply && a.machine != "" {
-		if err := juju("scp", "-m", model, runner+":"+remoteBackup, a.backup); err != nil {
+		owner := `sudo chown "$(id -u):$(id -g)" ` + remoteBackup
+		if err := juju("ssh", "-m", model, runner, owner); err != nil {
+			keepRemoteBackup = true
+			fmt.Fprintf(os.Stderr, "warning: could not prepare backup for fetch: %v; backup retained at %s:%s\n", err, runner, remoteBackup)
+		} else if err := juju("scp", "-m", model, runner+":"+remoteBackup, a.backup); err != nil {
 			keepRemoteBackup = true
 			fmt.Fprintf(os.Stderr, "warning: could not fetch backup: %v; backup retained at %s:%s\n", err, runner, remoteBackup)
 		} else {

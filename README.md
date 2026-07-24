@@ -52,7 +52,7 @@ The tool then removes the dead controller unit documents that block Juju cleanup
 
 It also removes the matching Dqlite node from the cluster.
 
-Before changing MongoDB, the tool writes the original replica-set config when applicable, the selected unit documents, the original machine document, and the application documents to a JSON file. Client mode copies this file back as `juju-controller-evict-backup-<machine>.json`.
+Before changing MongoDB, the tool writes the original replica-set config when applicable, the selected unit documents, the original machine document, and the application documents to a JSON file. The controller-side file is created with permissions restricted to its owner. In client mode, it is copied to the path passed with `-backup`, which defaults to `juju-controller-evict-backup.json`.
 
 ## Safety checks
 
@@ -77,15 +77,16 @@ Watch `juju status` until the machine disappears. Then restore the controller vo
 juju enable-ha -c mycontroller
 ```
 
-## Other options
+## Options
 
-- `-skip-mongo` removes only the Dqlite node.
-- `-skip-dqlite` changes only the Juju state in MongoDB.
-- `-agent-conf` selects the controller agent configuration and forces direct controller mode.
-- `-backup` changes the JSON output path.
-- `-timeout` sets the Dqlite operation timeout.
+- `-controller` selects the controller in client mode. It defaults to the current controller.
+- `-machine` selects the dead controller machine. Omit it to only report cluster state.
+- `-yes` applies the plan. Without it, the tool only reports the plan.
+- `-backup` selects the JSON backup path. The default is `juju-controller-evict-backup.json`.
+- `-timeout` sets the timeout shared by Dqlite calls. The default is two minutes.
+- `-version` prints the build version.
 
-Run `juju-controller-evict -help` for all path and connection options.
+Run `juju-controller-evict -help` for the exact option syntax.
 
 ## Limitations
 

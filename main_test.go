@@ -34,6 +34,26 @@ func TestLoadAgentConfRequiresControllerModel(t *testing.T) {
 	}
 }
 
+func TestWriteBackupIsPrivate(t *testing.T) {
+	path := t.TempDir() + "/backup.json"
+	if err := os.WriteFile(path, []byte("old backup"), 0o644); err != nil {
+		t.Fatalf("creating backup: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("setting backup permissions: %v", err)
+	}
+	if err := writeBackup(path, &plan{}); err != nil {
+		t.Fatalf("writing backup: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stating backup: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("backup permissions = %o, want 600", got)
+	}
+}
+
 func TestAssessForcedReplicaSetEviction(t *testing.T) {
 	baseConfig := replicaSetConfig{
 		Name:    "juju",

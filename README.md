@@ -20,9 +20,6 @@ If the machine can be recovered, start it and let Juju remove it normally.
 Run the binary from a Juju client logged in as a controller administrator.
 
 ```text
-# Show the MongoDB and Dqlite members.
-juju-controller-evict -controller mycontroller
-
 # Check the removal plan for machine 1 without changing anything.
 juju-controller-evict -controller mycontroller -machine 1
 
@@ -80,7 +77,7 @@ juju enable-ha -c mycontroller
 ## Options
 
 - `-controller` selects the controller in client mode. It defaults to the current controller.
-- `-machine` selects the dead controller machine. Omit it to only report cluster state.
+- `-machine` is required and selects the dead controller machine.
 - `-yes` applies the plan. Without it, the tool only reports the plan.
 - `-backup` selects the JSON backup path. The default is `juju-controller-evict-backup.json`.
 - `-timeout` sets the timeout shared by Dqlite calls. The default is two minutes.
@@ -105,8 +102,7 @@ Test the normal reconfig path with three voting controllers:
 3. Run `juju-controller-evict -controller <controller> -machine <id>`. An immediate run may refuse while the member is still transitioning. Wait until all samples report it down, then check that the plan says `remove replica set member`.
 4. Re-run with `-yes`.
 5. Check that `juju status -m <controller>:controller` no longer lists the machine.
-6. Run the tool without `-machine` and check that MongoDB and Dqlite no longer list the member.
-7. Run `juju enable-ha -c <controller>` and check that three controllers become available again.
+6. Run `juju enable-ha -c <controller>` and check that three controllers become available again.
 
 Test the no-primary force path from a disposable fixture snapshot that has exactly two voting MongoDB members and a pending forced machine-removal request. This topology is only for exercising the recovery path. Do not create it on a controller that holds useful models.
 

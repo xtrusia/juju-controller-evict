@@ -206,7 +206,7 @@ type deletion struct {
 }
 
 func main() {
-	machine := flag.String("machine", "", "machine id of the dead controller, e.g. 1 (omit to only report cluster state)")
+	machine := flag.String("machine", "", "required: machine id of the dead controller, e.g. 1")
 	controller := flag.String("controller", "", "run from a Juju client: name of the controller to act on (default: the current controller). Ignored on a controller machine")
 	backupPath := flag.String("backup", defaultBackupPath, "where to write the pre-change document backup")
 	apply := flag.Bool("yes", false, "apply the changes; without this the tool only reports what it would do")
@@ -217,6 +217,11 @@ func main() {
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+	if err := requireMachine(*machine); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		flag.Usage()
+		os.Exit(2)
 	}
 
 	// When not run on a controller machine, act as a driver: copy this binary
@@ -248,6 +253,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func requireMachine(machine string) error {
+	if machine == "" {
+		return fmt.Errorf("-machine is required")
+	}
+	return nil
 }
 
 // ---------- driver (runs on a Juju client) ----------
@@ -304,10 +316,7 @@ func drive(a driveArgs) error {
 		}
 	}()
 
-	remote := "sudo chmod +x " + remoteBin + " && sudo " + remoteBin
-	if a.machine != "" {
-		remote += " -machine " + a.machine
-	}
+	remote := "sudo chmod +x " + remoteBin + " && sudo " + remoteBin + " -machine " + a.machine
 	if a.apply {
 		remote += " -yes"
 	}
@@ -318,7 +327,7 @@ func drive(a driveArgs) error {
 	runErr := jujuStream("ssh", "-m", model, runner, remote)
 	fmt.Println("----")
 
-	if a.apply && a.machine != "" {
+	if a.apply {
 		owner := `sudo chown "$(id -u):$(id -g)" ` + remoteBackup
 		if err := juju("ssh", "-m", model, runner, owner); err != nil {
 			keepRemoteBackup = true
@@ -429,7 +438,7 @@ func run(a runArgs) error {
 		return err
 	}
 	localMachine := strings.TrimPrefix(localTag, "machine-")
-	if a.machine != "" && a.machine == localMachine {
+	if a.machine == localMachine {
 		return fmt.Errorf("refusing to evict machine %s: that is the machine this tool is running on", a.machine)
 	}
 
@@ -465,10 +474,6 @@ func run(a runArgs) error {
 	}
 	fmt.Println("\ndqlite cluster:")
 	printNodes(nodes, leader)
-
-	if a.machine == "" {
-		return nil
-	}
 
 	target, ok := memberForMachine(members, a.machine)
 	dqliteAlreadyRemoved := false

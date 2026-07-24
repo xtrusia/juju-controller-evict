@@ -54,6 +54,15 @@ func TestWriteBackupIsPrivate(t *testing.T) {
 	}
 }
 
+func TestRequireMachine(t *testing.T) {
+	if err := requireMachine(""); err == nil {
+		t.Fatal("expected an empty machine id to be rejected")
+	}
+	if err := requireMachine("0"); err != nil {
+		t.Fatalf("machine id 0 was rejected: %v", err)
+	}
+}
+
 func TestAssessForcedReplicaSetEviction(t *testing.T) {
 	baseConfig := replicaSetConfig{
 		Name:    "juju",

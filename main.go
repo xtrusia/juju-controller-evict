@@ -1127,6 +1127,7 @@ func planMongo(session *mgo.Session, modelUUID, machine string, p *plan) error {
 		return nil
 	}
 
+	var principalUnits []string
 	for _, u := range units {
 		id, ok := u["_id"].(string)
 		if !ok || id == "" {
@@ -1149,6 +1150,12 @@ func planMongo(session *mgo.Session, modelUUID, machine string, p *plan) error {
 		}
 		if unitModelUUID != p.ModelUUID {
 			return fmt.Errorf("units/%s belongs to model %s, expected %s", id, unitModelUUID, p.ModelUUID)
+		}
+		// Subordinate units carry a non-empty "principal" field naming their
+		// principal unit and are never listed in the machine's own
+		// "principals" array, so only principal units are checked below.
+		if principal, _ := u["principal"].(string); principal == "" {
+			principalUnits = append(principalUnits, name)
 		}
 		p.Units = append(p.Units, name)
 		p.Delete = append(p.Delete, deletion{Collection: "units", ID: id, Doc: u})
@@ -1198,7 +1205,7 @@ func planMongo(session *mgo.Session, modelUUID, machine string, p *plan) error {
 		p.Applications = append(p.Applications, change)
 	}
 
-	if err := validateMachinePrincipals(p.MachineDoc, p.Units); err != nil {
+	if err := validateMachinePrincipals(p.MachineDoc, principalUnits); err != nil {
 		return fmt.Errorf("machines/%s: %w", p.MachineDocID, err)
 	}
 	return nil

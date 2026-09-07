@@ -50,11 +50,9 @@ Use `-mongo-ca <path>` to select a CA file explicitly and `-mongo-cert <path>` t
 
 If the dead MongoDB member still has a vote and blocks the peer grouper, the tool first tries a normal replica-set reconfig. It uses a forced reconfig only when MongoDB rejects the normal attempt with a quorum-check failure. If no primary exists, the tool connects directly to the local MongoDB member and plans a forced reconfig. Every status sample must show that no primary exists. The tool samples the replica-set status again before any forced attempt. The remaining healthy voters must retain a majority and include a member that can become primary.
 
-If the replica-set change succeeds but the command stops before Juju cleanup, run the same command again. The tool matches the machine addresses to the remaining Dqlite node and continues after the MongoDB member has gone.
+If the replica-set or Dqlite change succeeds but the command stops before Juju cleanup, run the same command again. The tool uses the machine addresses to resume after either member has gone.
 
-The tool then removes the dead controller unit documents that block Juju cleanup. Juju removes the controller reference, and the tool marks the machine `Dead` so the provisioner can finish removing it.
-
-It also removes the matching Dqlite node from the cluster.
+The tool removes the matching Dqlite node, then removes the dead controller unit documents that block Juju cleanup. Juju removes the controller reference, and the tool marks the machine `Dead` so the provisioner can finish removing it.
 
 Before changing MongoDB, the tool writes the original replica-set config when applicable, the selected unit documents, the original machine document, and the application documents to a JSON file. Client mode copies this file back as `juju-controller-evict-backup-<machine>.json`.
 

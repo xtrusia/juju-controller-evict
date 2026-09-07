@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -401,6 +402,52 @@ func TestReconfigureReplicaSetWithoutMemberNormal(t *testing.T) {
 	}
 }
 
+func TestReconfigureReplicaSetAfterConfigSettles(t *testing.T) {
+	oldInterval := configurationInProgressRetryInterval
+	configurationInProgressRetryInterval = 0
+	t.Cleanup(func() { configurationInProgressRetryInterval = oldInterval })
+
+	runner := &recordingMongoRunner{reconfigErrors: []error{
+		&mgo.QueryError{Message: "Cannot run replSetReconfig because the node is currently updating its configuration"},
+	}}
+	eviction := &replicaSetEviction{
+		MemberID: 3,
+		Config: replicaSetConfig{Version: 7, Members: []replicaSetConfigMember{
+			{ID: 1, Address: "10.0.0.1:37017"},
+			{ID: 2, Address: "10.0.0.2:37017"},
+			{ID: 3, Address: "10.0.0.3:37017"},
+		}},
+	}
+
+	if err := reconfigureReplicaSetAfterConfigSettles(runner, eviction); err != nil {
+		t.Fatalf("reconfiguring after a concurrent config update: %v", err)
+	}
+	if len(runner.commands) != 2 {
+		t.Fatalf("got %d reconfig attempts, want 2", len(runner.commands))
+	}
+}
+
+func TestReconfigureReplicaSetDoesNotRetryOtherErrors(t *testing.T) {
+	runner := &recordingMongoRunner{reconfigErrors: []error{
+		&mgo.QueryError{Code: 13, Message: "not authorized"},
+	}}
+	eviction := &replicaSetEviction{
+		MemberID: 2,
+		Config: replicaSetConfig{Version: 7, Members: []replicaSetConfigMember{
+			{ID: 1, Address: "10.0.0.1:37017"},
+			{ID: 2, Address: "10.0.0.2:37017"},
+		}},
+	}
+
+	err := reconfigureReplicaSetAfterConfigSettles(runner, eviction)
+	if err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("got error %v, want authorization failure", err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("got %d reconfig attempts, want 1", len(runner.commands))
+	}
+}
+
 func TestIsQuorumCheckFailure(t *testing.T) {
 	tests := []struct {
 		name string
@@ -524,7 +571,8 @@ func TestRemovedMemberAddressAllowsRemovedDqliteNode(t *testing.T) {
 }
 
 type recordingMongoRunner struct {
-	commands []bson.D
+	commands       []bson.D
+	reconfigErrors []error
 }
 
 func (r *recordingMongoRunner) Run(command, result interface{}) error {
@@ -535,6 +583,11 @@ func (r *recordingMongoRunner) Run(command, result interface{}) error {
 	switch data[0].Name {
 	case "replSetReconfig":
 		r.commands = append(r.commands, data)
+		if len(r.reconfigErrors) > 0 {
+			err := r.reconfigErrors[0]
+			r.reconfigErrors = r.reconfigErrors[1:]
+			return err
+		}
 		return nil
 	case "replSetGetStatus":
 		status, ok := result.(*replicaSetStatus)
@@ -549,6 +602,47 @@ func (r *recordingMongoRunner) Run(command, result interface{}) error {
 }
 
 func (*recordingMongoRunner) Refresh() {}
+
+type recordingDqliteRemover struct {
+	nodeID uint64
+	nodes  []dqlite.NodeInfo
+}
+
+func (r *recordingDqliteRemover) Remove(ctx context.Context, nodeID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.nodeID = nodeID
+	return nil
+}
+
+func (r *recordingDqliteRemover) Cluster(ctx context.Context) ([]dqlite.NodeInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return r.nodes, nil
+}
+
+func TestRemoveDqliteNodeUsesFreshTimeout(t *testing.T) {
+	runner := &recordingDqliteRemover{nodes: []dqlite.NodeInfo{{ID: 1, Address: "10.0.0.1:17666"}}}
+	nodes, err := removeDqliteNode(runner, 2, time.Second)
+	if err != nil {
+		t.Fatalf("removing Dqlite node: %v", err)
+	}
+	if runner.nodeID != 2 || !reflect.DeepEqual(nodes, runner.nodes) {
+		t.Fatalf("unexpected removal result: node %d, nodes %#v", runner.nodeID, nodes)
+	}
+}
+
+func TestNodeForAddressReportsAbsence(t *testing.T) {
+	nodes := []dqlite.NodeInfo{{ID: 1, Address: "10.0.0.1:17666"}}
+	if _, found := nodeForAddress(nodes, "10.0.0.1:17666"); !found {
+		t.Fatal("existing Dqlite node was not found")
+	}
+	if _, found := nodeForAddress(nodes, "10.0.0.2:17666"); found {
+		t.Fatal("missing Dqlite node was reported as present")
+	}
+}
 
 func boolPointer(value bool) *bool          { return &value }
 func float64Pointer(value float64) *float64 { return &value }

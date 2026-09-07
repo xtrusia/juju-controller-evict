@@ -83,6 +83,8 @@ const (
 	primaryPollAttempts = 16
 	primaryPollInterval = time.Second
 
+	configurationInProgressAttempts = 6
+
 	// Juju machine lifecycle values stored in the "life" field.
 	lifeDying = 1
 	lifeDead  = 2
@@ -93,6 +95,8 @@ const (
 	dyingWait     = 3 * time.Minute
 	dyingPollTick = 5 * time.Second
 )
+
+var configurationInProgressRetryInterval = 2 * time.Second
 
 // unitDocCollections hold one document per unit, keyed by the unit name.
 // Derived from the live schema: units, statuses (workload, agent, charm),
@@ -214,7 +218,7 @@ func main() {
 	apply := flag.Bool("yes", false, "apply the changes; without this the tool only reports what it would do")
 	skipMongo := flag.Bool("skip-mongo", false, "leave the Juju state documents alone")
 	skipDqlite := flag.Bool("skip-dqlite", false, "leave the Dqlite cluster alone")
-	timeout := flag.Duration("timeout", 2*time.Minute, "overall timeout")
+	timeout := flag.Duration("timeout", 2*time.Minute, "Dqlite operation timeout")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -441,9 +445,6 @@ type runArgs struct {
 }
 
 func run(a runArgs) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
-	defer cancel()
-
 	if a.agentConf == "" {
 		found, err := findAgentConf()
 		if err != nil {
@@ -477,6 +478,8 @@ func run(a runArgs) error {
 	fmt.Println("mongo replica set:")
 	printMembers(members)
 
+	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	defer cancel()
 	dqliteCli, err := dialDqlite(ctx, conf, a.cluster)
 	if err != nil {
 		return err
@@ -491,6 +494,7 @@ func run(a runArgs) error {
 	if err != nil {
 		return fmt.Errorf("listing the Dqlite cluster: %w", err)
 	}
+	cancel()
 	fmt.Println("\ndqlite cluster:")
 	printNodes(nodes, leader)
 
@@ -539,17 +543,18 @@ func run(a runArgs) error {
 
 	var dqliteNode *dqlite.NodeInfo
 	if !a.skipDqlite && !dqliteAlreadyRemoved {
-		node, err := nodeForAddress(nodes, dqliteAddr)
-		if err != nil {
-			return err
+		node, found := nodeForAddress(nodes, dqliteAddr)
+		if !found {
+			dqliteAlreadyRemoved = true
+		} else {
+			if leader != nil && node.Address == leader.Address {
+				return fmt.Errorf("refusing to remove Dqlite node %d (%s): it is the current leader", node.ID, node.Address)
+			}
+			if err := checkNotListening(dqliteAddr); err != nil {
+				return err
+			}
+			dqliteNode = &node
 		}
-		if leader != nil && node.Address == leader.Address {
-			return fmt.Errorf("refusing to remove Dqlite node %d (%s): it is the current leader", node.ID, node.Address)
-		}
-		if err := checkNotListening(dqliteAddr); err != nil {
-			return err
-		}
-		dqliteNode = &node
 	}
 
 	p := plan{
@@ -602,7 +607,7 @@ func run(a runArgs) error {
 				forced = true
 				err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, true)
 			} else {
-				err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, false)
+				err = reconfigureReplicaSetAfterConfigSettles(session, p.ReplicaSetEviction)
 				if isQuorumCheckFailure(err) {
 					if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
 						return err
@@ -627,6 +632,12 @@ func run(a runArgs) error {
 				fmt.Printf("mongo: replica set member %d (%s) removed with a normal reconfig\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress)
 			}
 		}
+		if dqliteNode != nil {
+			if err := applyDqliteRemoval(dqliteCli, *dqliteNode, leader, a.timeout); err != nil {
+				return err
+			}
+			dqliteNode = nil
+		}
 		if err := applyMongo(session, &p); err != nil {
 			return err
 		}
@@ -637,16 +648,9 @@ func run(a runArgs) error {
 		fmt.Println("mongo: machine set Dead; the live provisioner will remove it")
 	}
 	if dqliteNode != nil {
-		fmt.Printf("dqlite: removing node %d (%s)...\n", dqliteNode.ID, dqliteNode.Address)
-		if err := dqliteCli.Remove(ctx, dqliteNode.ID); err != nil {
-			return fmt.Errorf("removing Dqlite node %d: %w", dqliteNode.ID, err)
+		if err := applyDqliteRemoval(dqliteCli, *dqliteNode, leader, a.timeout); err != nil {
+			return err
 		}
-		nodes, err = dqliteCli.Cluster(ctx)
-		if err != nil {
-			return fmt.Errorf("listing the Dqlite cluster after removal: %w", err)
-		}
-		fmt.Println("\ndqlite cluster after removal:")
-		printNodes(nodes, leader)
 	}
 
 	fmt.Printf("\ndone. Watch 'juju status' until machine %s disappears, then run 'juju enable-ha -c <controller>' to restore three voters.\n", a.machine)
@@ -1158,6 +1162,24 @@ func reconfigureReplicaSetWithoutMember(session mongoRunner, eviction *replicaSe
 	return fmt.Errorf("no MongoDB primary elected after removing member %d", eviction.MemberID)
 }
 
+func reconfigureReplicaSetAfterConfigSettles(session mongoRunner, eviction *replicaSetEviction) error {
+	for attempt := 0; attempt < configurationInProgressAttempts; attempt++ {
+		err := reconfigureReplicaSetWithoutMember(session, eviction, false)
+		if !isConfigurationInProgress(err) || attempt+1 == configurationInProgressAttempts {
+			return err
+		}
+		time.Sleep(configurationInProgressRetryInterval)
+		session.Refresh()
+	}
+	return nil
+}
+
+func isConfigurationInProgress(err error) bool {
+	var queryError *mgo.QueryError
+	return errors.As(err, &queryError) && queryError != nil &&
+		strings.Contains(queryError.Message, "currently updating its configuration")
+}
+
 func isQuorumCheckFailure(err error) bool {
 	// Code 11602 also identifies a primary transition, so it is not enough to
 	// permit a forced reconfig without MongoDB's explicit quorum-check message.
@@ -1593,17 +1615,42 @@ func dqliteTLSConfig(cert tls.Certificate, pool *x509.CertPool) (*tls.Config, er
 	return cfg, nil
 }
 
-func nodeForAddress(nodes []dqlite.NodeInfo, address string) (dqlite.NodeInfo, error) {
+func nodeForAddress(nodes []dqlite.NodeInfo, address string) (dqlite.NodeInfo, bool) {
 	for _, n := range nodes {
 		if n.Address == address {
-			return n, nil
+			return n, true
 		}
 	}
-	var known []string
-	for _, n := range nodes {
-		known = append(known, n.Address)
+	return dqlite.NodeInfo{}, false
+}
+
+type dqliteRemover interface {
+	Remove(context.Context, uint64) error
+	Cluster(context.Context) ([]dqlite.NodeInfo, error)
+}
+
+func removeDqliteNode(client dqliteRemover, nodeID uint64, timeout time.Duration) ([]dqlite.NodeInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := client.Remove(ctx, nodeID); err != nil {
+		return nil, fmt.Errorf("removing Dqlite node %d: %w", nodeID, err)
 	}
-	return dqlite.NodeInfo{}, fmt.Errorf("no Dqlite node has address %s; cluster has %s", address, strings.Join(known, ", "))
+	nodes, err := client.Cluster(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing the Dqlite cluster after removal: %w", err)
+	}
+	return nodes, nil
+}
+
+func applyDqliteRemoval(client dqliteRemover, node dqlite.NodeInfo, leader *dqlite.NodeInfo, timeout time.Duration) error {
+	fmt.Printf("dqlite: removing node %d (%s)...\n", node.ID, node.Address)
+	nodes, err := removeDqliteNode(client, node.ID, timeout)
+	if err != nil {
+		return err
+	}
+	fmt.Println("\ndqlite cluster after removal:")
+	printNodes(nodes, leader)
+	return nil
 }
 
 // checkNotListening refuses to proceed when the target still accepts

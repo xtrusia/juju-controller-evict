@@ -1268,7 +1268,7 @@ func planMongo(session *mgo.Session, modelUUID, machine string, p *plan) error {
 		p.Applications = append(p.Applications, change)
 	}
 
-	if err := validateMachinePrincipals(p.MachineDoc, p.Units); err != nil {
+	if err := validateMachinePrincipals(p.MachineDoc, units); err != nil {
 		return fmt.Errorf("machines/%s: %w", p.MachineDocID, err)
 	}
 	return nil
@@ -1294,42 +1294,78 @@ func applicationChangeFor(name, id string, decrement int, doc map[string]interfa
 	}, nil
 }
 
-func validateMachinePrincipals(doc map[string]interface{}, units []string) error {
+func validateMachinePrincipals(doc map[string]interface{}, units []map[string]interface{}) error {
 	principals, err := machinePrincipals(doc)
 	if err != nil {
 		return err
 	}
+	byName := make(map[string]map[string]interface{}, len(units))
 	for _, unit := range units {
-		if !principals[unit] {
-			return fmt.Errorf("unit %s is not present in principals", unit)
+		name, _ := unit["name"].(string)
+		if value, present := unit["principal"]; present {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("unit %s principal is not a string", name)
+			}
+		}
+		byName[name] = unit
+	}
+	for _, unit := range units {
+		name, _ := unit["name"].(string)
+		principal, _ := unit["principal"].(string)
+		if principal == "" {
+			if !principals[name] {
+				return fmt.Errorf("unit %s is not present in principals", name)
+			}
+			continue
+		}
+		parent, ok := byName[principal]
+		if !ok {
+			return fmt.Errorf("unit %s parent %s is not among the units being removed", name, principal)
+		}
+		if !principals[principal] {
+			return fmt.Errorf("unit %s parent %s is not present in principals", name, principal)
+		}
+		if parentPrincipal, _ := parent["principal"].(string); parentPrincipal != "" {
+			return fmt.Errorf("unit %s parent %s is itself a subordinate", name, principal)
+		}
+		subordinates, err := documentNames(parent, "subordinates")
+		if err != nil {
+			return fmt.Errorf("unit %s: %w", principal, err)
+		}
+		if !subordinates[name] {
+			return fmt.Errorf("unit %s is not present in parent %s subordinates", name, principal)
 		}
 	}
 	return nil
 }
 
 func machinePrincipals(doc map[string]interface{}) (map[string]bool, error) {
-	raw, ok := doc["principals"]
+	return documentNames(doc, "principals")
+}
+
+func documentNames(doc map[string]interface{}, field string) (map[string]bool, error) {
+	raw, ok := doc[field]
 	if !ok {
-		return nil, fmt.Errorf("principals is missing")
+		return nil, fmt.Errorf("%s is missing", field)
 	}
-	principals := map[string]bool{}
+	names := map[string]bool{}
 	switch values := raw.(type) {
 	case []interface{}:
 		for _, value := range values {
-			principal, ok := value.(string)
+			name, ok := value.(string)
 			if !ok {
-				return nil, fmt.Errorf("principals contains a non-string value")
+				return nil, fmt.Errorf("%s contains a non-string value", field)
 			}
-			principals[principal] = true
+			names[name] = true
 		}
 	case []string:
-		for _, principal := range values {
-			principals[principal] = true
+		for _, name := range values {
+			names[name] = true
 		}
 	default:
-		return nil, fmt.Errorf("principals is not an array")
+		return nil, fmt.Errorf("%s is not an array", field)
 	}
-	return principals, nil
+	return names, nil
 }
 
 func revalidateMongoPlan(session *mgo.Session, planned *plan) error {

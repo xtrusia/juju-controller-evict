@@ -612,12 +612,95 @@ func TestValidateMachinePrincipals(t *testing.T) {
 		"principals": []interface{}{"controller/0", "controller/1", "controller/2"},
 	}
 
-	if err := validateMachinePrincipals(doc, []string{"controller/1", "controller/2"}); err != nil {
+	if err := validateMachinePrincipals(doc, []map[string]interface{}{{"name": "controller/1"}, {"name": "controller/2"}}); err != nil {
 		t.Fatalf("validating machine principals: %v", err)
 	}
-	err := validateMachinePrincipals(doc, []string{"controller/1", "controller/3"})
+	err := validateMachinePrincipals(doc, []map[string]interface{}{{"name": "controller/1"}, {"name": "controller/3"}})
 	if err == nil || !strings.Contains(err.Error(), "controller/3") {
 		t.Fatalf("got error %v, want missing controller/3", err)
+	}
+}
+
+func TestValidateMachinePrincipalsWithSubordinates(t *testing.T) {
+	tests := []struct {
+		name    string
+		units   []map[string]interface{}
+		wantErr string
+	}{
+		{
+			name: "subordinate shares the parent machine",
+			units: []map[string]interface{}{
+				{"name": "grafana-agent/10", "principal": "controller/2"},
+				{"name": "controller/2", "principal": "", "subordinates": []interface{}{"grafana-agent/10"}},
+			},
+		},
+		{
+			name: "multiple subordinates",
+			units: []map[string]interface{}{
+				{"name": "controller/2", "subordinates": []string{"grafana-agent/10", "monitor/3"}},
+				{"name": "grafana-agent/10", "principal": "controller/2"},
+				{"name": "monitor/3", "principal": "controller/2"},
+			},
+		},
+		{
+			name:    "missing parent",
+			units:   []map[string]interface{}{{"name": "grafana-agent/10", "principal": "controller/2"}},
+			wantErr: "parent controller/2 is not among the units being removed",
+		},
+		{
+			name: "parent absent from machine principals",
+			units: []map[string]interface{}{
+				{"name": "grafana-agent/10", "principal": "controller/9"},
+				{"name": "controller/9", "subordinates": []string{"grafana-agent/10"}},
+			},
+			wantErr: "controller/9 is not present in principals",
+		},
+		{
+			name: "parent does not reference subordinate",
+			units: []map[string]interface{}{
+				{"name": "controller/2", "subordinates": []string{"grafana-agent/11"}},
+				{"name": "grafana-agent/10", "principal": "controller/2"},
+			},
+			wantErr: "grafana-agent/10 is not present in parent controller/2 subordinates",
+		},
+		{
+			name: "parent is another subordinate",
+			units: []map[string]interface{}{
+				{"name": "grafana-agent/10", "principal": "controller/2"},
+				{"name": "controller/2", "principal": "grafana-agent/10", "subordinates": []string{"grafana-agent/10"}},
+			},
+			wantErr: "parent controller/2 is itself a subordinate",
+		},
+		{
+			name:    "invalid principal type",
+			units:   []map[string]interface{}{{"name": "grafana-agent/10", "principal": 2}},
+			wantErr: "principal is not a string",
+		},
+		{
+			name: "invalid subordinate list",
+			units: []map[string]interface{}{
+				{"name": "controller/2", "subordinates": []interface{}{10}},
+				{"name": "grafana-agent/10", "principal": "controller/2"},
+			},
+			wantErr: "subordinates contains a non-string value",
+		},
+		{
+			name:    "principal unit still requires machine membership",
+			units:   []map[string]interface{}{{"name": "grafana-agent/10", "principal": ""}},
+			wantErr: "grafana-agent/10 is not present in principals",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateMachinePrincipals(map[string]interface{}{"principals": []string{"controller/2"}}, test.units)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("got error %v, want %q", err, test.wantErr)
+			}
+		})
 	}
 }
 

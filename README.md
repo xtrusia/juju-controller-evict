@@ -20,9 +20,6 @@ If the machine can be recovered, start it and let Juju remove it normally.
 Run the binary from a Juju client logged in as a controller administrator.
 
 ```text
-# Show the MongoDB and Dqlite members.
-juju-controller-evict -controller mycontroller
-
 # Check the removal plan for machine 1 without changing anything.
 juju-controller-evict -controller mycontroller -machine 1
 
@@ -44,7 +41,7 @@ Run it directly on a surviving controller when MongoDB has no primary. Client mo
 
 MongoDB CA discovery supports both separate and bundled certificates. By default, the tool reads `ca.crt` beside `server.pem`. If that file does not exist, it uses `cacert` from the controller's `agent.conf`, or the CA certificates bundled in `server.pem` when `cacert` is absent. Only CA certificates enter the trust pool; TLS certificate and hostname verification remain enabled.
 
-Use `-mongo-ca <path>` to select a CA file explicitly and `-mongo-cert <path>` to select the certificate/key bundle. Both paths refer to files on the surviving controller, including in client mode. An explicitly selected CA file must be readable and contain a CA certificate. Invalid or unreadable CA sources fail without falling back to another source.
+Invalid or unreadable CA sources fail without falling back to another source.
 
 ## What it changes
 
@@ -54,7 +51,7 @@ If the replica-set or Dqlite change succeeds but the command stops before Juju c
 
 The tool removes the matching Dqlite node, then removes the dead controller unit documents that block Juju cleanup. Juju removes the controller reference, and the tool marks the machine `Dead` so the provisioner can finish removing it.
 
-Before changing MongoDB, the tool writes the original replica-set config when applicable, the selected unit documents, the original machine document, and the application documents to a JSON file. Client mode copies this file back as `juju-controller-evict-backup-<machine>.json`.
+Before changing MongoDB, the tool writes the original replica-set config when applicable, the selected unit documents, the original machine document, and the application documents to a JSON file. The controller-side file is created with permissions restricted to its owner. In client mode, it is copied to the path passed with `-backup`, which defaults to `juju-controller-evict-backup.json`.
 
 ## Safety checks
 
@@ -79,15 +76,16 @@ Watch `juju status` until the machine disappears. Then restore the controller vo
 juju enable-ha -c mycontroller
 ```
 
-## Other options
+## Options
 
-- `-skip-mongo` removes only the Dqlite node.
-- `-skip-dqlite` changes only the Juju state in MongoDB.
-- `-agent-conf` selects the controller agent configuration and forces direct controller mode.
-- `-backup` changes the JSON output path.
-- `-timeout` sets the Dqlite operation timeout.
+- `-controller` selects the controller in client mode. It defaults to the current controller.
+- `-machine` is required and selects the dead controller machine.
+- `-yes` applies the plan. Without it, the tool only reports the plan.
+- `-backup` selects the JSON backup path. The default is `juju-controller-evict-backup.json`.
+- `-timeout` sets the timeout for each Dqlite operation. The default is two minutes.
+- `-version` prints the build version.
 
-Run `juju-controller-evict -help` for all path and connection options.
+Run `juju-controller-evict -help` for the exact option syntax.
 
 ## Limitations
 
@@ -106,8 +104,7 @@ Test the normal reconfig path with three voting controllers:
 3. Run `juju-controller-evict -controller <controller> -machine <id>`. An immediate run may refuse while the member is still transitioning. Wait until all samples report it down, then check that the plan says `remove replica set member`.
 4. Re-run with `-yes`.
 5. Check that `juju status -m <controller>:controller` no longer lists the machine.
-6. Run the tool without `-machine` and check that MongoDB and Dqlite no longer list the member.
-7. Run `juju enable-ha -c <controller>` and check that three controllers become available again.
+6. Run `juju enable-ha -c <controller>` and check that three controllers become available again.
 
 Test the no-primary force path from a disposable fixture snapshot that has exactly two voting MongoDB members and a pending forced machine-removal request. This topology is only for exercising the recovery path. Do not create it on a controller that holds useful models.
 

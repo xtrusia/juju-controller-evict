@@ -59,12 +59,15 @@ import (
 var version = "dev"
 
 const (
-	defaultDqlitePort = 17666
-	defaultStatePort  = 37017
-	mongoServerName   = "juju-mongodb"
-	stateDB           = "juju"
-	controllersC      = "controllers"
-	modelGlobalKey    = "e"
+	defaultDqlitePort  = 17666
+	defaultStatePort   = 37017
+	defaultClusterPath = "/var/lib/juju/dqlite/cluster.yaml"
+	defaultMongoCert   = "/var/snap/juju-db/common/server.pem"
+	defaultBackupPath  = "juju-controller-evict-backup.json"
+	mongoServerName    = "juju-mongodb"
+	stateDB            = "juju"
+	controllersC       = "controllers"
+	modelGlobalKey     = "e"
 
 	// MongoDB replica set member states returned by replSetGetStatus.
 	primaryState   = 1
@@ -208,16 +211,10 @@ type deletion struct {
 }
 
 func main() {
-	machine := flag.String("machine", "", "machine id of the dead controller, e.g. 1 (omit to only report cluster state)")
+	machine := flag.String("machine", "", "required: machine id of the dead controller, e.g. 1")
 	controller := flag.String("controller", "", "run from a Juju client: name of the controller to act on (default: the current controller). Ignored on a controller machine")
-	agentConfPath := flag.String("agent-conf", "", "agent.conf of a surviving controller (default: autodetect under /var/lib/juju/agents)")
-	clusterPath := flag.String("cluster", "/var/lib/juju/dqlite/cluster.yaml", "Dqlite cluster.yaml of a surviving controller")
-	mongoCA := flag.String("mongo-ca", "", "Mongo CA file on the controller (default: ca.crt beside -mongo-cert, agent.conf cacert, then CA certificates in -mongo-cert)")
-	mongoCert := flag.String("mongo-cert", "/var/snap/juju-db/common/server.pem", "certificate and key presented to mongod")
-	backupPath := flag.String("backup", "juju-controller-evict-backup.json", "where to write the pre-change document backup")
+	backupPath := flag.String("backup", defaultBackupPath, "where to write the pre-change document backup")
 	apply := flag.Bool("yes", false, "apply the changes; without this the tool only reports what it would do")
-	skipMongo := flag.Bool("skip-mongo", false, "leave the Juju state documents alone")
-	skipDqlite := flag.Bool("skip-dqlite", false, "leave the Dqlite cluster alone")
 	timeout := flag.Duration("timeout", 2*time.Minute, "Dqlite operation timeout")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -226,20 +223,22 @@ func main() {
 		fmt.Println(version)
 		return
 	}
+	if err := requireMachine(*machine); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	// When not run on a controller machine, act as a driver: copy this binary
 	// to a surviving controller over "juju scp", run it there, fetch the backup
-	// and clean up. An explicit -agent-conf forces worker mode.
-	if !onController() && *agentConfPath == "" {
+	// and clean up.
+	if !onController() {
 		if err := drive(driveArgs{
 			controller: *controller,
 			machine:    *machine,
+			backup:     *backupPath,
 			apply:      *apply,
-			skipMongo:  *skipMongo,
-			skipDqlite: *skipDqlite,
 			timeout:    *timeout,
-			mongoCA:    *mongoCA,
-			mongoCert:  *mongoCert,
 		}); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -248,20 +247,23 @@ func main() {
 	}
 
 	if err := run(runArgs{
-		machine:    *machine,
-		agentConf:  *agentConfPath,
-		cluster:    *clusterPath,
-		mongoCA:    *mongoCA,
-		mongoCert:  *mongoCert,
-		backup:     *backupPath,
-		apply:      *apply,
-		skipMongo:  *skipMongo,
-		skipDqlite: *skipDqlite,
-		timeout:    *timeout,
+		machine:   *machine,
+		cluster:   defaultClusterPath,
+		mongoCert: defaultMongoCert,
+		backup:    *backupPath,
+		apply:     *apply,
+		timeout:   *timeout,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func requireMachine(machine string) error {
+	if machine == "" {
+		return fmt.Errorf("-machine is required")
+	}
+	return nil
 }
 
 // ---------- driver (runs on a Juju client) ----------
@@ -269,12 +271,9 @@ func main() {
 type driveArgs struct {
 	controller string
 	machine    string
+	backup     string
 	apply      bool
-	skipMongo  bool
-	skipDqlite bool
 	timeout    time.Duration
-	mongoCA    string
-	mongoCert  string
 }
 
 func onController() bool {
@@ -321,49 +320,33 @@ func drive(a driveArgs) error {
 		}
 	}()
 
-	remote := "sudo chmod +x " + remoteBin + " && sudo " + remoteBin
-	if a.machine != "" {
-		remote += " -machine " + a.machine
-	}
+	remote := "sudo chmod +x " + remoteBin + " && sudo " + remoteBin + " -machine " + a.machine
 	if a.apply {
 		remote += " -yes"
 	}
-	if a.skipMongo {
-		remote += " -skip-mongo"
-	}
-	if a.skipDqlite {
-		remote += " -skip-dqlite"
-	}
-	remote += " -backup " + remoteBackup + " -timeout " + a.timeout.String() + mongoPathFlags(a.mongoCA, a.mongoCert)
+	remote += " -backup " + remoteBackup + " -timeout " + a.timeout.String()
 
 	fmt.Println("running on the controller:")
 	fmt.Println("----")
 	runErr := jujuStream("ssh", "-m", model, runner, remote)
 	fmt.Println("----")
 
-	if a.apply && a.machine != "" && !a.skipMongo {
-		local := "juju-controller-evict-backup-" + a.machine + ".json"
-		if err := juju("scp", "-m", model, runner+":"+remoteBackup, local); err != nil {
+	if a.apply {
+		owner := `sudo chown "$(id -u):$(id -g)" ` + remoteBackup
+		if err := juju("ssh", "-m", model, runner, owner); err != nil {
+			keepRemoteBackup = true
+			fmt.Fprintf(os.Stderr, "warning: could not prepare backup for fetch: %v; backup retained at %s:%s\n", err, runner, remoteBackup)
+		} else if err := juju("scp", "-m", model, runner+":"+remoteBackup, a.backup); err != nil {
 			keepRemoteBackup = true
 			fmt.Fprintf(os.Stderr, "warning: could not fetch backup: %v; backup retained at %s:%s\n", err, runner, remoteBackup)
 		} else {
-			fmt.Printf("backup fetched to %s\n", local)
+			fmt.Printf("backup fetched to %s\n", a.backup)
 		}
 	}
 	if runErr != nil {
 		return fmt.Errorf("running tool on %s: %w", runner, runErr)
 	}
 	return nil
-}
-
-func mongoPathFlags(caPath, certPath string) string {
-	var flags string
-	for _, option := range []struct{ name, path string }{{"mongo-ca", caPath}, {"mongo-cert", certPath}} {
-		if option.path != "" {
-			flags += " -" + option.name + " '" + strings.ReplaceAll(option.path, "'", "'\"'\"'") + "'"
-		}
-	}
-	return flags
 }
 
 func currentController() (string, error) {
@@ -432,16 +415,14 @@ func jujuStream(args ...string) error {
 }
 
 type runArgs struct {
-	machine    string
-	agentConf  string
-	cluster    string
-	mongoCA    string
-	mongoCert  string
-	backup     string
-	apply      bool
-	skipMongo  bool
-	skipDqlite bool
-	timeout    time.Duration
+	machine   string
+	agentConf string
+	cluster   string
+	mongoCA   string
+	mongoCert string
+	backup    string
+	apply     bool
+	timeout   time.Duration
 }
 
 func run(a runArgs) error {
@@ -458,7 +439,7 @@ func run(a runArgs) error {
 		return err
 	}
 	localMachine := strings.TrimPrefix(localTag, "machine-")
-	if a.machine != "" && a.machine == localMachine {
+	if a.machine == localMachine {
 		return fmt.Errorf("refusing to evict machine %s: that is the machine this tool is running on", a.machine)
 	}
 
@@ -498,10 +479,6 @@ func run(a runArgs) error {
 	fmt.Println("\ndqlite cluster:")
 	printNodes(nodes, leader)
 
-	if a.machine == "" {
-		return nil
-	}
-
 	target, ok := memberForMachine(members, a.machine)
 	dqliteAlreadyRemoved := false
 	if !ok {
@@ -512,9 +489,6 @@ func run(a runArgs) error {
 	}
 	var replicaSetEviction *replicaSetEviction
 	if ok && target.Votes > 0 {
-		if a.skipMongo {
-			return fmt.Errorf("member %s still has a vote; cannot force-remove it with -skip-mongo", target.Address)
-		}
 		replicaSetEviction, err = planForcedReplicaSetEviction(session, target)
 		if err != nil {
 			return err
@@ -524,7 +498,7 @@ func run(a runArgs) error {
 			return err
 		}
 	}
-	if directMongo && !a.skipMongo && (replicaSetEviction == nil || !replicaSetEviction.NoPrimary) {
+	if directMongo && (replicaSetEviction == nil || !replicaSetEviction.NoPrimary) {
 		return fmt.Errorf("direct Mongo connection is only permitted for a forced voter eviction when every status sample has no primary")
 	}
 	if target.Address == "" && !dqliteAlreadyRemoved {
@@ -542,7 +516,7 @@ func run(a runArgs) error {
 	}
 
 	var dqliteNode *dqlite.NodeInfo
-	if !a.skipDqlite && !dqliteAlreadyRemoved {
+	if !dqliteAlreadyRemoved {
 		node, found := nodeForAddress(nodes, dqliteAddr)
 		if !found {
 			dqliteAlreadyRemoved = true
@@ -567,10 +541,8 @@ func run(a runArgs) error {
 	if dqliteNode != nil {
 		p.DqliteNodeID = dqliteNode.ID
 	}
-	if !a.skipMongo {
-		if err := planMongo(session, conf.ModelUUID, a.machine, &p); err != nil {
-			return err
-		}
+	if err := planMongo(session, conf.ModelUUID, a.machine, &p); err != nil {
+		return err
 	}
 
 	fmt.Printf("\nplan for dead controller machine %s (%s):\n", a.machine, host)
@@ -580,78 +552,68 @@ func run(a runArgs) error {
 		fmt.Println("\ndry run: nothing was changed. Re-run with -yes to apply.")
 		return nil
 	}
-	if !a.skipMongo {
-		if err := writeBackup(a.backup, &p); err != nil {
-			return err
-		}
-		backupDocuments := len(p.Delete) + len(p.Applications) + 1
-		if p.ReplicaSetEviction != nil {
-			backupDocuments++
-		}
-		fmt.Printf("\nbackup of %d documents written to %s\n", backupDocuments, a.backup)
+	if err := writeBackup(a.backup, &p); err != nil {
+		return err
 	}
+	backupDocuments := len(p.Delete) + len(p.Applications) + 1
+	if p.ReplicaSetEviction != nil {
+		backupDocuments++
+	}
+	fmt.Printf("\nbackup of %d documents written to %s\n", backupDocuments, a.backup)
 
-	if !a.skipMongo {
-		if p.ReplicaSetEviction != nil {
-			if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
-				return err
-			}
-		}
-		if err := revalidateMongoPlan(session, &p); err != nil {
+	if p.ReplicaSetEviction != nil {
+		if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
 			return err
 		}
-		if p.ReplicaSetEviction != nil {
-			forced := false
-			var err error
-			if directMongo {
-				forced = true
+	}
+	if err := revalidateMongoPlan(session, &p); err != nil {
+		return err
+	}
+	if p.ReplicaSetEviction != nil {
+		forced := false
+		var err error
+		if directMongo {
+			forced = true
+			err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, true)
+		} else {
+			err = reconfigureReplicaSetAfterConfigSettles(session, p.ReplicaSetEviction)
+			if isQuorumCheckFailure(err) {
+				if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
+					return err
+				}
+				if err := revalidateMongoPlan(session, &p); err != nil {
+					return err
+				}
 				err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, true)
-			} else {
-				err = reconfigureReplicaSetAfterConfigSettles(session, p.ReplicaSetEviction)
-				if isQuorumCheckFailure(err) {
-					if err := revalidateReplicaSetEviction(session, p.ReplicaSetEviction); err != nil {
-						return err
-					}
-					if err := revalidateMongoPlan(session, &p); err != nil {
-						return err
-					}
-					err = reconfigureReplicaSetWithoutMember(session, p.ReplicaSetEviction, true)
-					forced = true
-				}
-			}
-			if err != nil {
-				return err
-			}
-			if forced {
-				reason := "after the normal reconfig lost quorum"
-				if directMongo {
-					reason = "because no primary was available"
-				}
-				fmt.Printf("mongo: replica set member %d (%s) force-removed %s\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress, reason)
-			} else {
-				fmt.Printf("mongo: replica set member %d (%s) removed with a normal reconfig\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress)
+				forced = true
 			}
 		}
-		if dqliteNode != nil {
-			if err := applyDqliteRemoval(dqliteCli, *dqliteNode, leader, a.timeout); err != nil {
-				return err
-			}
-			dqliteNode = nil
-		}
-		if err := applyMongo(session, &p); err != nil {
+		if err != nil {
 			return err
 		}
-		fmt.Println("mongo: unit documents removed; waiting for Juju to retire the machine...")
-		if err := advanceMachineDead(session, &p); err != nil {
-			return err
+		if forced {
+			reason := "after the normal reconfig lost quorum"
+			if directMongo {
+				reason = "because no primary was available"
+			}
+			fmt.Printf("mongo: replica set member %d (%s) force-removed %s\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress, reason)
+		} else {
+			fmt.Printf("mongo: replica set member %d (%s) removed with a normal reconfig\n", p.ReplicaSetEviction.MemberID, p.ReplicaSetEviction.MemberAddress)
 		}
-		fmt.Println("mongo: machine set Dead; the live provisioner will remove it")
 	}
 	if dqliteNode != nil {
 		if err := applyDqliteRemoval(dqliteCli, *dqliteNode, leader, a.timeout); err != nil {
 			return err
 		}
 	}
+	if err := applyMongo(session, &p); err != nil {
+		return err
+	}
+	fmt.Println("mongo: unit documents removed; waiting for Juju to retire the machine...")
+	if err := advanceMachineDead(session, &p); err != nil {
+		return err
+	}
+	fmt.Println("mongo: machine set Dead; the live provisioner will remove it")
 
 	fmt.Printf("\ndone. Watch 'juju status' until machine %s disappears, then run 'juju enable-ha -c <controller>' to restore three voters.\n", a.machine)
 	return nil
@@ -665,7 +627,7 @@ func findAgentConf() (string, error) {
 		return "", err
 	}
 	if len(matches) == 0 {
-		return "", fmt.Errorf("no agent.conf under /var/lib/juju/agents; run this on a controller machine or pass -agent-conf")
+		return "", fmt.Errorf("no agent.conf under /var/lib/juju/agents; run this on a controller machine")
 	}
 	return matches[0], nil
 }
@@ -730,7 +692,7 @@ func mongoTLSConfig(conf *agentConf, caPath, certPath string) (*tls.Config, erro
 		}
 	}
 	if caCount == 0 {
-		return nil, fmt.Errorf("no CA certificate found in %s; set -mongo-ca to a CA certificate file", source)
+		return nil, fmt.Errorf("no CA certificate found in %s", source)
 	}
 	cert, err := tls.LoadX509KeyPair(certPath, certPath)
 	if err != nil {
@@ -1564,7 +1526,10 @@ func writeBackup(path string, p *plan) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 // ---------- dqlite ----------

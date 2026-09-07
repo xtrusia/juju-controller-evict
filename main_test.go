@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -174,28 +173,32 @@ func TestMongoTLSConfig(t *testing.T) {
 	}
 }
 
-func TestMongoPathFlags(t *testing.T) {
-	for _, paths := range [][2]string{
-		{},
-		{"/path/ca.crt", "/path/server.pem"},
-		{"/path with spaces/ca's.crt", "/path/$(printf expanded).pem"},
-		{"", "/path/server.pem"},
-	} {
-		flags := mongoPathFlags(paths[0], paths[1])
-		out, err := exec.Command("sh", "-c", "set --"+flags+"; for arg do printf '%s\\n' \"$arg\"; done").Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		var want string
-		if paths[0] != "" {
-			want += "-mongo-ca\n" + paths[0] + "\n"
-		}
-		if paths[1] != "" {
-			want += "-mongo-cert\n" + paths[1] + "\n"
-		}
-		if string(out) != want {
-			t.Fatalf("remote Mongo path arguments = %q, want %q", out, want)
-		}
+func TestWriteBackupIsPrivate(t *testing.T) {
+	path := t.TempDir() + "/backup.json"
+	if err := os.WriteFile(path, []byte("old backup"), 0o644); err != nil {
+		t.Fatalf("creating backup: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("setting backup permissions: %v", err)
+	}
+	if err := writeBackup(path, &plan{}); err != nil {
+		t.Fatalf("writing backup: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stating backup: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("backup permissions = %o, want 600", got)
+	}
+}
+
+func TestRequireMachine(t *testing.T) {
+	if err := requireMachine(""); err == nil {
+		t.Fatal("expected an empty machine id to be rejected")
+	}
+	if err := requireMachine("0"); err != nil {
+		t.Fatalf("machine id 0 was rejected: %v", err)
 	}
 }
 

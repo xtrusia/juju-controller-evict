@@ -42,6 +42,10 @@ sudo ./juju-controller-evict -machine 1 -yes
 
 Run it directly on a surviving controller when MongoDB has no primary. Client mode depends on the Juju API, which may be unavailable after MongoDB loses quorum.
 
+MongoDB CA discovery supports both separate and bundled certificates. By default, the tool reads `ca.crt` beside `server.pem`. If that file does not exist, it uses `cacert` from the controller's `agent.conf`, or the CA certificates bundled in `server.pem` when `cacert` is absent. Only CA certificates enter the trust pool; TLS certificate and hostname verification remain enabled.
+
+Use `-mongo-ca <path>` to select a CA file explicitly and `-mongo-cert <path>` to select the certificate/key bundle. Both paths refer to files on the surviving controller, including in client mode. An explicitly selected CA file must be readable and contain a CA certificate. Invalid or unreadable CA sources fail without falling back to another source.
+
 ## What it changes
 
 If the dead MongoDB member still has a vote and blocks the peer grouper, the tool first tries a normal replica-set reconfig. It uses a forced reconfig only when MongoDB rejects the normal attempt with a quorum-check failure. If no primary exists, the tool connects directly to the local MongoDB member and plans a forced reconfig. Every status sample must show that no primary exists. The tool samples the replica-set status again before any forced attempt. The remaining healthy voters must retain a majority and include a member that can become primary.

@@ -31,6 +31,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -99,6 +100,7 @@ const (
 var unitDocCollections = []string{"statuses", "unitstates", "constraints"}
 
 type agentConf struct {
+	CACert         string `yaml:"cacert"`
 	ControllerCert string `yaml:"controllercert"`
 	ControllerKey  string `yaml:"controllerkey"`
 	StatePassword  string `yaml:"statepassword"`
@@ -206,7 +208,7 @@ func main() {
 	controller := flag.String("controller", "", "run from a Juju client: name of the controller to act on (default: the current controller). Ignored on a controller machine")
 	agentConfPath := flag.String("agent-conf", "", "agent.conf of a surviving controller (default: autodetect under /var/lib/juju/agents)")
 	clusterPath := flag.String("cluster", "/var/lib/juju/dqlite/cluster.yaml", "Dqlite cluster.yaml of a surviving controller")
-	mongoCA := flag.String("mongo-ca", "/var/snap/juju-db/common/ca.crt", "CA certificate mongod was started with")
+	mongoCA := flag.String("mongo-ca", "", "Mongo CA file on the controller (default: ca.crt beside -mongo-cert, agent.conf cacert, then CA certificates in -mongo-cert)")
 	mongoCert := flag.String("mongo-cert", "/var/snap/juju-db/common/server.pem", "certificate and key presented to mongod")
 	backupPath := flag.String("backup", "juju-controller-evict-backup.json", "where to write the pre-change document backup")
 	apply := flag.Bool("yes", false, "apply the changes; without this the tool only reports what it would do")
@@ -232,6 +234,8 @@ func main() {
 			skipMongo:  *skipMongo,
 			skipDqlite: *skipDqlite,
 			timeout:    *timeout,
+			mongoCA:    *mongoCA,
+			mongoCert:  *mongoCert,
 		}); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
@@ -265,6 +269,8 @@ type driveArgs struct {
 	skipMongo  bool
 	skipDqlite bool
 	timeout    time.Duration
+	mongoCA    string
+	mongoCert  string
 }
 
 func onController() bool {
@@ -324,7 +330,7 @@ func drive(a driveArgs) error {
 	if a.skipDqlite {
 		remote += " -skip-dqlite"
 	}
-	remote += " -backup " + remoteBackup + " -timeout " + a.timeout.String()
+	remote += " -backup " + remoteBackup + " -timeout " + a.timeout.String() + mongoPathFlags(a.mongoCA, a.mongoCert)
 
 	fmt.Println("running on the controller:")
 	fmt.Println("----")
@@ -344,6 +350,16 @@ func drive(a driveArgs) error {
 		return fmt.Errorf("running tool on %s: %w", runner, runErr)
 	}
 	return nil
+}
+
+func mongoPathFlags(caPath, certPath string) string {
+	var flags string
+	for _, option := range []struct{ name, path string }{{"mongo-ca", caPath}, {"mongo-cert", certPath}} {
+		if option.path != "" {
+			flags += " -" + option.name + " '" + strings.ReplaceAll(option.path, "'", "'\"'\"'") + "'"
+		}
+	}
+	return flags
 }
 
 func currentController() (string, error) {
@@ -672,24 +688,62 @@ func loadAgentConf(path string) (*agentConf, error) {
 
 // ---------- mongo ----------
 
-func dialMongo(localTag string, conf *agentConf, caPath, certPath string) (*mgo.Session, bool, error) {
-	caPEM, err := os.ReadFile(caPath)
+func mongoTLSConfig(conf *agentConf, caPath, certPath string) (*tls.Config, error) {
+	source := caPath
+	if source == "" {
+		source = filepath.Join(filepath.Dir(certPath), "ca.crt")
+	}
+	caPEM, err := os.ReadFile(source)
+	if caPath == "" && errors.Is(err, os.ErrNotExist) {
+		if conf.CACert != "" {
+			source, caPEM, err = "agent.conf cacert", []byte(conf.CACert), nil
+		} else {
+			source = certPath
+			caPEM, err = os.ReadFile(source)
+		}
+	}
 	if err != nil {
-		return nil, false, fmt.Errorf("reading mongo CA: %w", err)
+		return nil, fmt.Errorf("reading mongo CA: %w", err)
 	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, false, fmt.Errorf("no certificate found in %s", caPath)
+	caCount := 0
+	for len(caPEM) > 0 {
+		block, rest := pem.Decode(caPEM)
+		if block == nil {
+			break
+		}
+		caPEM = rest
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parsing mongo CA from %s: %w", source, err)
+		}
+		if cert.IsCA {
+			pool.AddCert(cert)
+			caCount++
+		}
+	}
+	if caCount == 0 {
+		return nil, fmt.Errorf("no CA certificate found in %s; set -mongo-ca to a CA certificate file", source)
 	}
 	cert, err := tls.LoadX509KeyPair(certPath, certPath)
 	if err != nil {
-		return nil, false, fmt.Errorf("loading mongo client certificate: %w", err)
+		return nil, fmt.Errorf("loading mongo client certificate: %w", err)
 	}
-	tlsConfig := &tls.Config{
+	return &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		RootCAs:      pool,
 		Certificates: []tls.Certificate{cert},
 		ServerName:   mongoServerName,
+	}, nil
+}
+
+func dialMongo(localTag string, conf *agentConf, caPath, certPath string) (*mgo.Session, bool, error) {
+	tlsConfig, err := mongoTLSConfig(conf, caPath, certPath)
+	if err != nil {
+		return nil, false, err
 	}
 	addr := net.JoinHostPort("127.0.0.1", fmt.Sprint(conf.statePort()))
 	info := &mgo.DialInfo{
